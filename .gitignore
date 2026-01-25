@@ -1,0 +1,20 @@
+# --- Python 垃圾文件 ---
+__pycache__/
+*.py[cod]
+
+# --- 虚拟环境 (不要上传这个，很慢且没用) ---
+.venv/
+env/
+venv/
+
+# --- 打包生成的文件 ---
+build/
+dist/
+*.spec
+
+# --- 下载的数据 (不要上传财报文件) ---
+sec-edgar-filings/
+SEC_Filings/
+
+# --- VS Code 配置 ---
+.vscode/
