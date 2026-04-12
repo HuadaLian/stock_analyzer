@@ -17,6 +17,9 @@ sec-edgar-filings/
 SEC_Filings/
 CN_Fillings/
 
+# --- 敏感信息 ---
+.env
+
 # --- VS Code 配置 ---
 .vscode/
 /CN_Filings/002110/2015年年度报告.pdf
@@ -257,3 +260,23 @@ CN_Fillings/
 /CN_Filings/601006/大秦铁路2025年半年度报告.pdf
 /CN_Filings/601006/大秦铁路2025年第一季度报告.pdf
 /CN_Filings/601006/大秦铁路股份有限公司2025年第三季度报告.pdf
+/saved_tables/AAPL_US/fcf_table_20260411_153626.csv
+/saved_tables/AAPL_US/fcf_table_20260411_154822.csv
+/saved_tables/AAPL_US/fcf_table_20260411_155038.csv
+/saved_tables/AAPL_US/fcf_table_20260411_162712.csv
+/saved_tables/AAPL_US/fcf_table_20260411_163439.csv
+/saved_tables/AAPL_US/fcf_table_20260411_164042.csv
+/saved_tables/AAPL_US/fcf_table_20260411_170753.csv
+/saved_tables/AAPL_US/fcf_table_20260411_184622.csv
+/saved_tables/AAPL_US/fcf_table.csv
+/saved_tables/LEN_US/fcf_table_20260411_173452.csv
+/saved_tables/LEN_US/fcf_table.csv
+/saved_tables/PDD_US/fcf_table_20260411_163335.csv
+/saved_tables/PDD_US/fcf_table_20260411_163824.csv
+/saved_tables/PDD_US/fcf_table_20260411_165357.csv
+/saved_tables/PDD_US/fcf_table_20260411_170731.csv
+/saved_tables/PDD_US/fcf_table.csv
+/saved_tables/model_status.json
+/SEC_Data/facts_0000320193.json
+/SEC_Data/facts_0000920760.json
+/SEC_Data/facts_0001737806.json

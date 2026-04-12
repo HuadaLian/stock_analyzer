@@ -1,16 +1,18 @@
-# downloader.py
+ # downloader.py
 import os
 import time
 import requests
 import re
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from filing_store import FilingStore
 
 class SmartSECDownloader:
+    DEFAULT_FORMS = ['10-K', '10-Q', '20-F', '6-K']
+
     def __init__(self, email):
         self.headers = {"User-Agent": f"ResearchApp {email}", "Host": "www.sec.gov"}
         self.data_headers = {"User-Agent": f"ResearchApp {email}", "Host": "data.sec.gov"}
-        self.target_forms = ['10-K', '10-Q', '20-F', '6-K']
 
     def get_cik(self, ticker, manual_url=None):
         if manual_url:
@@ -39,14 +41,20 @@ class SmartSECDownloader:
                     exhibits.append(full_url)
         return list(set(exhibits))
 
-    def _process_batch(self, filings, cik, ticker, log_func):
+    def _process_batch(self, filings, cik, ticker, log_func, form_filter=None):
+        allowed = self.DEFAULT_FORMS
+        if form_filter:
+            keywords = [k.strip().upper() for k in form_filter.split(',') if k.strip()]
+            if keywords:
+                allowed = keywords
         count = 0
         base_dir = os.path.join(os.getcwd(), "SEC_Filings", ticker.upper())
         total = len(filings['accessionNumber'])
         for i in range(total):
             form = filings['form'][i]
-            if form not in self.target_forms: continue
+            if form not in allowed: continue
             r_date = filings['reportDate'][i] or filings['filingDate'][i]
+            f_date = filings['filingDate'][i] or r_date
             if r_date < "2005-01-01": continue
 
             save_dir = os.path.join(base_dir, form)
@@ -54,7 +62,7 @@ class SmartSECDownloader:
             doc = filings['primaryDocument'][i]
             acc = filings['accessionNumber'][i].replace("-", "")
             
-            fname = f"{r_date}_{form}_{doc}"
+            fname = f"{r_date}_{f_date}_{form}_{doc}"
             path = os.path.join(save_dir, fname)
             main_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{doc}"
 
@@ -80,20 +88,136 @@ class SmartSECDownloader:
                     log_func(f"❌ 下载失败 {fname}: {e}")
         return count
 
-    def download_all(self, cik, ticker, log_func):
+    def download_all(self, cik, ticker, log_func, form_filter=None):
         api_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
         log_func(f"📡 获取索引数据: {ticker} (CIK: {cik})...")
         r = requests.get(api_url, headers=self.data_headers)
         if r.status_code != 200: raise Exception(f"无法获取索引 (Code {r.status_code})")
         data = r.json()
-        total_dl = self._process_batch(data['filings']['recent'], cik, ticker, log_func)
+        total_dl = self._process_batch(data['filings']['recent'], cik, ticker, log_func, form_filter)
         if 'files' in data['filings']:
             for h_file in data['filings']['files']:
                 time.sleep(0.15)
                 r_h = requests.get(f"https://data.sec.gov/submissions/{h_file['name']}", headers=self.data_headers)
                 if r_h.status_code == 200:
-                    total_dl += self._process_batch(r_h.json(), cik, ticker, log_func)
+                    total_dl += self._process_batch(r_h.json(), cik, ticker, log_func, form_filter)
         return total_dl
+
+    # ── Smart download (uses FilingStore) ─────────────────────────────
+    def _collect_all_submission_batches(self, cik):
+        """Fetch all submission batches from SEC (recent + historical)."""
+        api_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+        r = requests.get(api_url, headers=self.data_headers, timeout=15)
+        if r.status_code != 200:
+            raise Exception(f"无法获取索引 (Code {r.status_code})")
+        data = r.json()
+        batches = [data["filings"]["recent"]]
+        if "files" in data["filings"]:
+            for h_file in data["filings"]["files"]:
+                time.sleep(0.15)
+                r_h = requests.get(
+                    f"https://data.sec.gov/submissions/{h_file['name']}",
+                    headers=self.data_headers, timeout=15,
+                )
+                if r_h.status_code == 200:
+                    batches.append(r_h.json())
+        return batches
+
+    def smart_download_us(self, ticker, log_func, sec_url=None):
+        """Download all 10-K/20-F + current-year 10-Q/6-K, with dedup.
+
+        Returns: FilingStore instance (call .summary() for stats).
+        """
+        store = FilingStore(ticker)
+        cik = self.get_cik(ticker, sec_url)
+        store.cik = cik
+        log_func(f"📡 CIK: {cik} | 正在扫描 SEC 索引...")
+
+        current_year = datetime.now().year
+        batches = self._collect_all_submission_batches(cik)
+
+        # Phase 1: Register all filings into the index
+        total_registered = 0
+        for filings in batches:
+            n = len(filings["accessionNumber"])
+            for i in range(n):
+                form = filings["form"][i]
+                # We want: all annual (10-K, 20-F) + current-year quarterly (10-Q, 6-K)
+                is_annual = form in ("10-K", "20-F")
+                is_quarterly = form in ("10-Q", "6-K")
+                if not is_annual and not is_quarterly:
+                    continue
+
+                r_date = filings["reportDate"][i] or filings["filingDate"][i]
+                if r_date < "2005-01-01":
+                    continue
+
+                # For quarterly, only current year and previous year
+                if is_quarterly:
+                    try:
+                        yr = int(r_date[:4])
+                    except ValueError:
+                        continue
+                    if yr < current_year - 1:
+                        continue
+
+                acc = filings["accessionNumber"][i]
+                store.register_filing(
+                    accession=acc,
+                    form=form,
+                    report_date=r_date,
+                    filing_date=filings["filingDate"][i],
+                    primary_doc=filings["primaryDocument"][i],
+                )
+                total_registered += 1
+
+        log_func(f"📋 索引完成: {total_registered} 份报告已注册")
+
+        # Phase 2: Download missing filings
+        download_count = 0
+        for entry in store.filings:
+            if store.is_downloaded(entry["accession"]):
+                continue
+
+            form = entry["form"]
+            r_date = entry["report_date"]
+            f_date = entry.get("filing_date") or r_date
+            doc = entry["primary_doc"]
+            acc = entry["accession"].replace("-", "")
+
+            save_dir = os.path.join(store.store_dir, form)
+            os.makedirs(save_dir, exist_ok=True)
+            fname = f"{r_date}_{f_date}_{form}_{doc}"
+            local_path = os.path.join(form, fname)
+            full_path = os.path.join(store.store_dir, local_path)
+
+            if os.path.exists(full_path):
+                store.mark_downloaded(entry["accession"], local_path)
+                continue
+
+            main_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{doc}"
+            time.sleep(0.12)
+            try:
+                rr = requests.get(main_url, headers=self.headers, timeout=15)
+                if rr.status_code == 200:
+                    with open(full_path, "wb") as f:
+                        f.write(rr.content)
+                    store.mark_downloaded(entry["accession"], local_path)
+                    download_count += 1
+                    log_func(f"⬇️ {form} {r_date}: {doc}")
+                else:
+                    log_func(f"⚠️ {form} {r_date}: HTTP {rr.status_code}")
+            except Exception as e:
+                log_func(f"❌ {form} {r_date}: {e}")
+
+        store.save()
+        s = store.summary()
+        log_func(
+            f"🎉 完成! 年报 {s['annual_downloaded']}/{s['annual_total']} | "
+            f"季报 {s['quarterly_downloaded']}/{s['quarterly_total']} | "
+            f"本次新下载 {download_count} 份"
+        )
+        return store
 
 class CninfoDownloader:
     def __init__(self):
@@ -124,8 +248,12 @@ class CninfoDownloader:
         start_date = (datetime.now() - timedelta(days=365*10)).strftime("%Y-%m-%d")
         se_date = f"{start_date} ~ {end_date}"
 
-        categories = "category_ndbg_szsh;category_bndbg_szsh;category_yjdbg_szsh;category_sjdbg_szsh;"
-        
+        # Default: annual/semi-annual/Q1/Q3 reports; override with keyword if provided
+        if keyword:
+            categories = ""
+        else:
+            categories = "category_ndbg_szsh;category_bndbg_szsh;category_yjdbg_szsh;category_sjdbg_szsh;"
+
         page_num = 1
         total_dl_count = 0
         base_dir = os.path.join(os.getcwd(), "CN_Filings", code)

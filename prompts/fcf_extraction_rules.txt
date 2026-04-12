@@ -1,0 +1,64 @@
+# FCF 提取核心规则 (Core Extraction Rules)
+# 此文件的内容会作为规则发送给 Gemini AI。
+# 你可以直接编辑此文件来调整 AI 的提取行为，修改后下次运行 AI 填表时自动生效。
+# ─────────────────────────────────────────────────────────
+
+## 提取字段
+
+1. OCF (经营活动现金流):
+   - EN: "Net cash provided by / used in operating activities"
+   - CN: "经营活动产生的现金流量净额"
+
+2. CapEx (资本支出) — 返回正数 (取绝对值):
+   - EN: "Purchases of property and equipment" / "Capital expenditure"
+         / "Payments for acquisition of property and equipment"
+   - CN: "购建固定资产、无形资产和其他长期资产支付的现金"
+
+3. FCF = OCF - CapEx
+
+4. 总股本 (Weighted Average Diluted Shares) — 最关键也最容易出错的字段:
+   a) 必须找 "weighted-average DILUTED shares outstanding" (加权平均摊薄股数)
+      不要用 basic shares，除非 diluted 完全找不到。
+   b) 查找位置（按优先级）:
+      - Earnings Per Share (EPS) section → 分母就是 diluted shares
+      - Consolidated Statements of Operations 底部 EPS 计算
+      - Notes to Financial Statements → "Share Capital" / "Shares" 附注
+      - 中文年报: "基本每股收益" 的计算说明 → 找 "加权平均摊薄股数"
+   c) ⚠️ 单位换算（极其重要，这是最常见的错误来源）:
+      - 检查表头或财务报表开头是否标注了单位
+      - "in thousands" / "千" → 数字 × 1,000
+      - "in millions" / "百万" → 数字 × 1,000,000
+      - "in billions" / "十亿" → 数字 × 1,000,000,000
+      - "万股" → 数字 × 10,000
+      - "亿股" → 数字 × 100,000,000
+      - 返回的 总股本 必须是实际股数 (例如 3,580,000,000)，不是缩写形式
+      - 一般公司的总股本在 1亿 ~ 100亿 之间，如果你算出来不在这个范围，请回头检查单位
+   d) 如果 diluted 不可得，退而求其次用 basic shares / 期末总股本
+
+5. 每股FCF = FCF / 总股本
+
+## 输出格式
+- 所有货币值保持年报原始币种和单位
+- CapEx 必须为正数
+- 找不到的值用 null
+- 只返回 JSON，不要附带说明文字
+
+## 常见异常模式 (提取时请自查)
+
+1. 单位错误 (最常见！):
+   - 相邻年份的 OCF/CapEx/FCF 差异 100x~1000x → 几乎 100% 是单位漏乘
+   - 同一份报表中不同表格可能用不同单位 (如 cash flow 用 thousands, EPS 用 millions)
+   - 中文报表尤其注意: 封面 "万元" vs 正文 "千元" vs 附注 "元"
+
+2. 符号错误:
+   - CapEx 应为正数 (取绝对值)。如果看到 negative CapEx，请取 abs()
+   - OCF 某一年突然变号 (正→负或反之)，需确认是否确实如此
+
+3. 股本单位:
+   - 总股本应为实际股数，不是 "千股" "万股" "百万股"
+   - 如果算出的总股本 < 1,000,000 或 > 100,000,000,000，极可能单位错误
+   - ADS 与 ordinary shares 的区别: 如果公司发行 ADS，注意换算比例
+
+4. 年份对齐:
+   - 有的公司财年不是 12 月结束 (如 3 月、6 月)，注意 fiscal year 的实际区间
+   - 确保提取的数据与请求的 fiscal year 一致
