@@ -241,6 +241,30 @@ def _has_fcf_table(ticker: str, market: str) -> bool:
     )
 
 
+def _dcf_metrics_from_data(data: dict) -> tuple[float, float]:
+    """Return (inv_potential_pct, short_potential_pct) or (nan, nan).
+
+    inv_potential_pct   = (dcf_14x - price) / price * 100  (positive = undervalued vs 14x)
+    short_potential_pct = (price - dcf_34x) / price * 100  (positive = overvalued vs 34x)
+    Both are nan when latest 3-yr avg FCF <= 0.
+    """
+    from data_provider import compute_dcf_lines
+    price = data.get("last_price")
+    fcf_ps = data.get("fcf_per_share_by_year", {})
+    if not price or not fcf_ps:
+        return float("nan"), float("nan")
+    dcf_df = compute_dcf_lines(fcf_ps)
+    if dcf_df.empty:
+        return float("nan"), float("nan")
+    dcf_14x = dcf_df["dcf_14x"].iloc[-1]
+    dcf_34x = dcf_df["dcf_34x"].iloc[-1]
+    if dcf_14x <= 0:
+        return float("nan"), float("nan")
+    inv_pot   = (dcf_14x - price) / price * 100
+    short_pot = (price - dcf_34x) / price * 100
+    return inv_pot, short_pot
+
+
 def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
     from gemini_chat import load_fcf_table
 
@@ -267,7 +291,7 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
     with sc1:
         sort_by = st.radio(
             "排列方式",
-            ["分析时间 (最新)", "市值 (最大)", "代码 (升序)"],
+            ["分析时间 (最新)", "市值 (最大)", "投资潜力 (最高)", "做空潜力 (最高)", "代码 (升序)"],
             horizontal=True,
             key=f"rev_{market}_sort",
             label_visibility="collapsed",
@@ -279,12 +303,46 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
             label_visibility="collapsed",
         )
 
+    # ── Compute DCF metrics for each ticker ──────────────────────────
+    import math
+
+    def _get_dcf_metrics(tk, info):
+        # Try cached tracker metadata first (stored after each analysis)
+        dcf_14x = info.get("dcf_14x")
+        dcf_34x = info.get("dcf_34x")
+        price   = info.get("last_price")
+        if dcf_14x and dcf_34x and price and dcf_14x > 0:
+            inv_pot   = (dcf_14x - price) / price * 100
+            short_pot = (price - dcf_34x) / price * 100
+            return inv_pot, short_pot
+        # Fallback: load from pickle (cached in session_state to avoid re-loading)
+        cache_key = f"_dcf_cache_{market}_{tk}"
+        if cache_key in st.session_state:
+            return st.session_state[cache_key]
+        try:
+            chart_data = load_chart(tk, market)
+            if chart_data:
+                result = _dcf_metrics_from_data(chart_data)
+            else:
+                result = (float("nan"), float("nan"))
+        except Exception:
+            result = (float("nan"), float("nan"))
+        st.session_state[cache_key] = result
+        return result
+
     items = [
-        (tk, info, float(info.get("market_cap") or 0))
+        (tk, info, float(info.get("market_cap") or 0), *_get_dcf_metrics(tk, info))
         for tk, info in market_items.items()
     ]
+
+    _nan_last_desc = lambda v: v if not math.isnan(v) else -math.inf
+
     if sort_by == "市值 (最大)":
         items.sort(key=lambda x: x[2], reverse=True)
+    elif sort_by == "投资潜力 (最高)":
+        items.sort(key=lambda x: _nan_last_desc(x[3]), reverse=True)
+    elif sort_by == "做空潜力 (最高)":
+        items.sort(key=lambda x: _nan_last_desc(x[4]), reverse=True)
     elif sort_by == "代码 (升序)":
         items.sort(key=lambda x: x[0])
     else:
@@ -292,9 +350,9 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
 
     visible_items = items[:show_limit]
 
-    # ── Build display DataFrame (no FCF column) ──────────────────────
+    # ── Build display DataFrame ───────────────────────────────────────
     rows = []
-    for tk, info, mcap_num in visible_items:
+    for tk, info, mcap_num, inv_pot, short_pot in visible_items:
         univ = universe.get(tk, {}) if universe else {}
         name    = univ.get("name", info.get("name", ""))
         ts      = info.get("timestamp", "?")[:16]
@@ -306,6 +364,8 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
             row["行业"] = univ.get("industry", "")
             row["地区"] = univ.get("area", "")
         row["市值"] = mcap_str
+        row["投资潜力%"] = None if math.isnan(inv_pot) else round(inv_pot, 2)
+        row["做空潜力%"] = None if math.isnan(short_pot) else round(short_pot, 2)
         row["状态"] = status_str
         row["分析时间"] = ts
         rows.append(row)
@@ -315,6 +375,10 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
     st.caption("点击任意行查看该股票图表 ↓")
     event = st.dataframe(
         df,
+        column_config={
+            "投资潜力%": st.column_config.NumberColumn("投资潜力%", format="%.1f%%"),
+            "做空潜力%": st.column_config.NumberColumn("做空潜力%", format="%.1f%%"),
+        },
         use_container_width=True,
         hide_index=True,
         on_select="rerun",
