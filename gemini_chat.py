@@ -1783,6 +1783,11 @@ def fill_fcf_table_with_llm(
         log("⚠️ 未找到任何年报文件，无法进行 AI 补全。")
         return fcf_table, logs, prompt_info
 
+    # LLM request budget: 2× annual filings, minimum 4
+    max_successful_requests = max(4, 2 * len(annual_filings))
+    _successful_llm_calls = 0
+    log(f"🔢 LLM请求上限: {max_successful_requests} 次 (年报数量 {len(annual_filings)} × 2，最少4次)")
+
     # ── Determine filing years & add missing rows ─────────────────────
     # Build year → (report_date, filing_date) from annual filings
     _yr_report_date: dict = {}
@@ -1995,6 +2000,10 @@ def fill_fcf_table_with_llm(
         batch_years = [y for y, _, _ in batch]
         log(f"\n🤖 批次 {batch_i+1}/{total_batches}: 年份 {batch_years}")
 
+        if _successful_llm_calls >= max_successful_requests:
+            log(f"⛔ 已达到LLM请求上限 ({max_successful_requests} 次)，跳过剩余批次。")
+            break
+
         if progress_callback:
             progress_callback(None, processed, total_years)
 
@@ -2025,6 +2034,7 @@ def fill_fcf_table_with_llm(
                 ),
                 log_fn=log, enabled_models=_enabled,
             )
+            _successful_llm_calls += 1
         except Exception as e:
             log(f"❌ 批次 {batch_i+1} Gemini 请求失败 (已重试 {_MAX_RETRIES} 次): {e}")
             failed_years.extend(batch_years)
@@ -2095,6 +2105,9 @@ def fill_fcf_table_with_llm(
             if progress_callback:
                 progress_callback(None, processed, total_years + len(failed_years))
 
+            if _successful_llm_calls >= max_successful_requests:
+                log(f"⛔ 已达到LLM请求上限 ({max_successful_requests} 次)，跳过重试。")
+                break
             log(f"🔄 重试 {year}...")
             _is_cn_retry = (market or "").upper() == "CN"
             if _is_cn_retry:
@@ -2121,6 +2134,7 @@ def fill_fcf_table_with_llm(
                     ),
                     max_retries=2, log_fn=log, enabled_models=_enabled,
                 )
+                _successful_llm_calls += 1
             except Exception as e:
                 log(f"❌ {year}: 重试仍然失败: {e}")
                 processed += 1
@@ -2177,6 +2191,9 @@ def fill_fcf_table_with_llm(
     _na_key_cols = ["OCF", "CapEx", "FCF"]
 
     for na_round in range(_NA_RETRY_ROUNDS):
+        if _successful_llm_calls >= max_successful_requests:
+            log(f"⛔ 已达到LLM请求上限，跳过NA补填。")
+            break
         # Find years that still have N/A in key columns and have a filing
         na_years = []
         for _, row in filled.iterrows():
@@ -2201,6 +2218,9 @@ def fill_fcf_table_with_llm(
 
         _is_cn_na = (market or "").upper() == "CN"
         for yr in na_years:
+            if _successful_llm_calls >= max_successful_requests:
+                log(f"⛔ 已达到LLM请求上限，跳过剩余NA年份。")
+                break
             fin_text, _tok, label = year_filing_text[yr]
             if _is_cn_na:
                 _na_prompt = _build_batch_fcf_prompt_cn(filled.to_csv(index=False), [yr])
@@ -2227,6 +2247,7 @@ def fill_fcf_table_with_llm(
                     ),
                     max_retries=2, log_fn=log, enabled_models=_enabled,
                 )
+                _successful_llm_calls += 1
             except Exception as e:
                 log(f"❌ {yr}: NA 补填失败: {e}")
                 continue
@@ -2271,6 +2292,9 @@ def fill_fcf_table_with_llm(
     _EXPAND_RANGE = 3  # check ±3 years around each flagged year
 
     for v_iter in range(1, _MAX_VERIFY_ITERATIONS + 1):
+        if _successful_llm_calls >= max_successful_requests:
+            log(f"⛔ 已达到LLM请求上限，跳过验证迭代。")
+            break
         log(
             f"\n🔍 验证迭代 {v_iter}/{_MAX_VERIFY_ITERATIONS}: "
             "先横向检测(OCF-CapEx 是否在 FCF 的70%-130%)，再纵向检测(相邻年份数量级 ≥100x)..."
@@ -2370,6 +2394,9 @@ def fill_fcf_table_with_llm(
         any_correction = False
         step2_token_rows = []
         for yr in expanded_years:
+            if _successful_llm_calls >= max_successful_requests:
+                log(f"⛔ 已达到LLM请求上限，跳过后续验证年份。")
+                break
             filing = _find_filing_for_year(yr, annual_filings)
             if not filing:
                 continue
@@ -2421,6 +2448,7 @@ def fill_fcf_table_with_llm(
                         ),
                         log_fn=log, enabled_models=_enabled,
                     )
+                    _successful_llm_calls += 1
                     parsed = _parse_llm_json(reply)
                     corrections = _normalize_verification_corrections(parsed, filled)
                     if corrections:
@@ -2448,45 +2476,50 @@ def fill_fcf_table_with_llm(
                         break
 
             if need_full_fallback:
-                try:
-                    full_text = extract_text(filing["path"])
-                    max_chars = _MAX_TOKENS_PER_FILING * 4
-                    if len(full_text) > max_chars:
-                        full_text = full_text[:max_chars]
-                    step2_token_rows.append({
-                        "year": yr, "kind": "完整", "tokens": estimate_tokens(full_text),
-                        "label": filing["label"],
-                    })
-                    prompt_info["batch_prompts"].append(
-                        f"[VERIFICATION iter{v_iter} STEP2 year{yr} full]\n{fix_prompt}"
-                    )
-                    log(f"📄 Step2 {yr}: 节选不足，回退到完整年报")
-                    import time
-                    time.sleep(5)
-                    reply = _gemini_call_with_retry(
-                        client, model_name,
-                        contents=[types.Content(role="user", parts=[
-                            types.Part(text=f"═══ FULL Annual report: {filing['label']} (Fiscal Year {yr}) ═══\n\n{full_text}"),
-                            types.Part(text=fix_prompt),
-                        ])],
-                        config=types.GenerateContentConfig(
-                            system_instruction=_v_sys_prompt,
-                            temperature=0.1,
-                        ),
-                        log_fn=log, enabled_models=_enabled,
-                    )
-                    parsed = _parse_llm_json(reply)
-                    corrections = _normalize_verification_corrections(parsed, filled)
-                    if corrections:
-                        log(
-                            f"📨 Gemini 验证 iter{v_iter} Step2 year{yr} full 回复:\n"
-                            f"{_render_parsed_llm_for_log(corrections, 1000)}"
-                        )
-                    else:
-                        log(f"📨 Gemini 验证 iter{v_iter} Step2 year{yr} full 回复:\n{_format_llm_output_for_log(reply, 1000)}")
-                except Exception as e:
-                    log(f"⚠️ 验证 iter{v_iter} year{yr} 完整年报失败: {e}")
+                if _successful_llm_calls >= max_successful_requests:
+                    log(f"⛔ 已达到LLM请求上限，跳过完整年报验证。")
                     corrections = []
+                else:
+                    try:
+                        full_text = extract_text(filing["path"])
+                        max_chars = _MAX_TOKENS_PER_FILING * 4
+                        if len(full_text) > max_chars:
+                            full_text = full_text[:max_chars]
+                        step2_token_rows.append({
+                            "year": yr, "kind": "完整", "tokens": estimate_tokens(full_text),
+                            "label": filing["label"],
+                        })
+                        prompt_info["batch_prompts"].append(
+                            f"[VERIFICATION iter{v_iter} STEP2 year{yr} full]\n{fix_prompt}"
+                        )
+                        log(f"📄 Step2 {yr}: 节选不足，回退到完整年报")
+                        import time
+                        time.sleep(5)
+                        reply = _gemini_call_with_retry(
+                            client, model_name,
+                            contents=[types.Content(role="user", parts=[
+                                types.Part(text=f"═══ FULL Annual report: {filing['label']} (Fiscal Year {yr}) ═══\n\n{full_text}"),
+                                types.Part(text=fix_prompt),
+                            ])],
+                            config=types.GenerateContentConfig(
+                                system_instruction=_v_sys_prompt,
+                                temperature=0.1,
+                            ),
+                            log_fn=log, enabled_models=_enabled,
+                        )
+                        _successful_llm_calls += 1
+                        parsed = _parse_llm_json(reply)
+                        corrections = _normalize_verification_corrections(parsed, filled)
+                        if corrections:
+                            log(
+                                f"📨 Gemini 验证 iter{v_iter} Step2 year{yr} full 回复:\n"
+                                f"{_render_parsed_llm_for_log(corrections, 1000)}"
+                            )
+                        else:
+                            log(f"📨 Gemini 验证 iter{v_iter} Step2 year{yr} full 回复:\n{_format_llm_output_for_log(reply, 1000)}")
+                    except Exception as e:
+                        log(f"⚠️ 验证 iter{v_iter} year{yr} 完整年报失败: {e}")
+                        corrections = []
 
             if isinstance(corrections, list) and corrections:
                 for item in corrections:
@@ -2568,6 +2601,7 @@ def fill_fcf_table_with_llm(
 
     log(f"\n🎉 完成! 共处理 {total_years} 个年份" +
         (f"，其中 {len(failed_years)} 个需要重试" if failed_years else ""))
+    log(f"📊 LLM请求统计: 共使用 {_successful_llm_calls}/{max_successful_requests} 次成功请求")
     if progress_callback:
         progress_callback(None, total_years, total_years)
 
