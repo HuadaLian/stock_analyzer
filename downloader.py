@@ -174,8 +174,14 @@ class SmartSECDownloader:
 
         # Phase 2: Download missing filings
         download_count = 0
+        skipped_excerpted = 0
         for entry in store.filings:
             if store.is_downloaded(entry["accession"]):
+                continue
+
+            # Skip if excerpt already cached — raw file not needed until next fill
+            if not store.needs_download(entry["accession"]):
+                skipped_excerpted += 1
                 continue
 
             form = entry["form"]
@@ -211,10 +217,11 @@ class SmartSECDownloader:
 
         store.save()
         s = store.summary()
+        skip_msg = f" | 节选已缓存跳过 {skipped_excerpted} 份" if skipped_excerpted else ""
         log_func(
             f"🎉 完成! 年报 {s['annual_downloaded']}/{s['annual_total']} | "
             f"季报 {s['quarterly_downloaded']}/{s['quarterly_total']} | "
-            f"本次新下载 {download_count} 份"
+            f"本次新下载 {download_count} 份{skip_msg}"
         )
         return store
 

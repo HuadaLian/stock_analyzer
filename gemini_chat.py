@@ -1738,6 +1738,7 @@ def fill_fcf_table_with_llm(
     progress_callback=None,
     table_update_callback=None,
     enabled_models=None,
+    filing_store=None,
 ):
     """Use Gemini to fill N/A values (and add missing years) by reading annual reports.
 
@@ -1916,7 +1917,7 @@ def fill_fcf_table_with_llm(
                 results_map[yr] = (fin_text, tokens, full_tokens, label, err)
 
         # Reassemble in year-descending order (preserve original ordering)
-        for year, _ in sorted(year_filing_pairs, key=lambda x: -x[0]):
+        for year, filing in sorted(year_filing_pairs, key=lambda x: -x[0]):
             fin_text, tokens, full_tokens, label, err = results_map[year]
             if err:
                 log(f"❌ {year}: 文件读取失败: {err}")
@@ -1927,6 +1928,14 @@ def fill_fcf_table_with_llm(
             token_rows.append({"year": year, "kind": "节选", "tokens": tokens, "label": label})
             token_rows.append({"year": year, "kind": "完整", "tokens": full_tokens, "label": label})
             year_filing_text[year] = (fin_text, tokens, label)
+            # Record excerpt state so raw filing can be safely deleted later
+            if filing_store is not None:
+                fpath = filing.get("path", "")
+                if fpath:
+                    try:
+                        filing_store.mark_excerpted_by_path(fpath, tokens)
+                    except Exception:
+                        pass
 
     _kind_rank = {"节选": 0, "完整": 1}
     _log_token_estimate_table(

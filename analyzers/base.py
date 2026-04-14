@@ -507,7 +507,7 @@ class MarketAnalyzer:
 
     # ── AI fill flow ─────────────────────────────────────────────────
 
-    def _run_ai_fill(self, data, ticker):
+    def _run_ai_fill(self, data, ticker, filing_store=None):
         """Run AI fill + validate flow. Returns st.empty placeholder or None."""
         gemini_api_key = st.session_state.get("gemini_api_key", "")
         gemini_model = st.session_state.get("gemini_model_name", "")
@@ -574,8 +574,14 @@ class MarketAnalyzer:
                 progress_callback=_progress,
                 table_update_callback=_table_callback,
                 enabled_models=enabled_models,
+                filing_store=filing_store,
             )
             progress_bar.progress(1.0, text=f"完成 | {_fmt_counter(prog)}")
+            # Delete raw filings whose excerpts are now cached
+            if filing_store is not None:
+                n = filing_store.delete_raw_filings()
+                if n:
+                    _progress(msg=f"🗑 已删除 {n} 份原始年报文件（节选已缓存，可随时重新下载）")
             # Show prompt used
             with st.expander("📜 查看发送给 Gemini 的 Prompt", expanded=False):
                 st.markdown(f"**System Prompt:**\n```\n{prompt_info['system_prompt']}\n```")
@@ -619,7 +625,7 @@ class MarketAnalyzer:
                 ticker = self.normalize_ticker(ticker_raw)
 
                 # Step 1: Download filings (optional, subclass overrides)
-                self.download_filings_ui(ticker)
+                filing_store = self.download_filings_ui(ticker)
 
                 # Step 2: Fetch data
                 data = None
@@ -642,7 +648,7 @@ class MarketAnalyzer:
                 # Step 3: AI fill + validate
                 tbl_placeholder = None
                 if data is not None:
-                    tbl_placeholder = self._run_ai_fill(data, ticker)
+                    tbl_placeholder = self._run_ai_fill(data, ticker, filing_store=filing_store)
 
                     # Step 4: Apply adjusted FCF + store in session state
                     data = self._apply_adjusted_fcf(data)

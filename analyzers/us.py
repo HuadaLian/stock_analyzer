@@ -51,9 +51,11 @@ class USAnalyzer(MarketAnalyzer):
         with st.spinner(f"正在索引并下载 {ticker} SEC 报告..."):
             try:
                 dl = SmartSECDownloader(email="lianhdff@gmail.com")
-                dl.smart_download_us(ticker, sec_logger)
+                filing_store = dl.smart_download_us(ticker, sec_logger)
+                return filing_store
             except Exception as e:
                 sec_logger(f"⚠️ SEC 报告下载遇到问题 (分析将继续): {e}")
+                return None
 
     def render_extra_ui(self, ticker):
         # Manual download expander

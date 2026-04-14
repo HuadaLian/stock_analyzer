@@ -121,6 +121,8 @@ class FilingStore:
             "primary_doc": primary_doc,
             "downloaded": downloaded,
             "local_path": local_path,
+            "has_excerpt": False,
+            "excerpt_tokens": 0,
         })
 
     def mark_downloaded(self, accession: str, local_path: str):
@@ -129,6 +131,58 @@ class FilingStore:
                 f["downloaded"] = True
                 f["local_path"] = local_path
                 return
+
+    def needs_download(self, accession: str) -> bool:
+        """True only when raw file absent AND excerpt not cached — safe to skip download."""
+        for f in self.filings:
+            if f["accession"] == accession:
+                if f.get("has_excerpt"):
+                    return False  # excerpt exists → raw file not needed
+                lp = f.get("local_path", "")
+                return not os.path.exists(os.path.join(self.store_dir, lp))
+        return True
+
+    def mark_excerpted(self, accession: str, tokens: int = 0):
+        """Record that a filing's financial excerpt has been cached to disk."""
+        for f in self.filings:
+            if f["accession"] == accession:
+                f["has_excerpt"] = True
+                f["excerpt_tokens"] = tokens
+                self.save()
+                return
+
+    def mark_excerpted_by_path(self, file_path: str, tokens: int = 0):
+        """Look up filing by its local file path and mark as excerpted."""
+        try:
+            rel = os.path.relpath(file_path, self.store_dir)
+        except ValueError:
+            rel = file_path  # different drive on Windows — use as-is
+        for f in self.filings:
+            lp = f.get("local_path", "")
+            if lp and (lp == rel or os.path.normpath(lp) == os.path.normpath(rel)):
+                self.mark_excerpted(f["accession"], tokens)
+                return
+
+    def delete_raw_filings(self) -> int:
+        """Delete raw files for all excerpted filings. Returns number deleted."""
+        deleted = 0
+        for f in self.filings:
+            if not f.get("has_excerpt"):
+                continue
+            lp = f.get("local_path", "")
+            if not lp:
+                continue
+            full_path = os.path.join(self.store_dir, lp)
+            if os.path.exists(full_path):
+                try:
+                    os.remove(full_path)
+                    f["downloaded"] = False
+                    deleted += 1
+                except OSError:
+                    pass
+        if deleted:
+            self.save()
+        return deleted
 
     # ── Summary for UI ───────────────────────────────────────────────
     def summary(self) -> dict:
