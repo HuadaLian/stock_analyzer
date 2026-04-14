@@ -367,19 +367,39 @@ FCF_SYSTEM_PROMPT = (
 
 # CN-specific system prompt (Chinese, A-share annual reports)
 FCF_SYSTEM_PROMPT_CN = (
-    "你是一个专业的财务数据提取专家。"
-    "你阅读A股上市公司年度报告，并从【合并现金流量表】中精确提取现金流数据。\n\n"
-    "★★★ 关键规则 — 单位声明 ★★★\n"
-    "在提取任何数字之前，必须先找到报表表头的单位声明，例如：\n"
-    "  '单位：元'、'单位：人民币元'、'单位：千元'、'单位：万元'、'单位：百万元'\n"
-    "将所有数字乘以对应单位，换算为【人民币元】的实际金额。\n"
-    "示例：单位：万元，看到 12,345 → 实际金额 = 123,450,000 元。\n"
-    "同一份报告中不同报表的单位可能不同，每张报表需单独核查。\n\n"
-    "★★★ 关键字段定义 ★★★\n"
-    "  OCF  = 经营活动产生的现金流量净额\n"
-    "  CapEx = 购建固定资产、无形资产和其他长期资产支付的现金（取正值）\n"
-    "  FCF  = OCF − CapEx\n\n"
-    "必须返回合法 JSON 数组，JSON 之外不得有任何说明文字。"
+    "你是一名专业的A股财务数据提取专家，熟悉中国上市公司年度报告（年报）的结构与会计准则。\n\n"
+
+    "【核心任务】\n"
+    "从A股上市公司年度报告的【合并现金流量表】中精确提取三项数据：OCF、CapEx、FCF。\n\n"
+
+    "【字段定义】\n"
+    "• OCF   = 经营活动产生的现金流量净额\n"
+    "• CapEx = 购建固定资产、无形资产和其他长期资产支付的现金（取正值）\n"
+    "• FCF   = OCF − CapEx\n\n"
+
+    "【单位换算规则（关键）】\n"
+    "提取任何数字前，必须先定位该张报表的单位声明：\n"
+    "  单位：元 / 人民币元      → ×1\n"
+    "  单位：千元               → ×1,000\n"
+    "  单位：万元               → ×10,000\n"
+    "  单位：百万元             → ×1,000,000\n"
+    "  单位：亿元               → ×100,000,000\n"
+    "示例：单位：万元，数值 45,678.9 → 实际 = 456,789,000 元\n"
+    "同一份年报中不同报表的单位可能不同，每张表必须单独核查。\n\n"
+
+    "【A股年报结构要点】\n"
+    "• 年报财务报表章节通常在第十节/第十一节『财务报告』或『财务报表』中\n"
+    "• 若同时存在『合并现金流量表』与『母公司现金流量表』，只取【合并】数据\n"
+    "• 括号数值表示负数：(1,234,567) = -1,234,567\n"
+    "• CapEx 在现金流量表中本为负号的现金流出，提取时须取绝对值（返回正数）\n"
+    "• 只使用年度（全年 12-31）数据，不要使用半年报或季报中间期数据\n\n"
+
+    "【质量控制】\n"
+    "• FCF = OCF - CapEx，若报表给出 FCF 请核对是否一致\n"
+    "• CapEx 不能为零（所有实体企业均有资本支出）\n"
+    "• 返回值必须为换算后的人民币元（CNY）实际金额\n\n"
+
+    "必须返回合法 JSON 数组，JSON 之外不得有任何说明文字或 markdown 代码块标记。"
 )
 
 
@@ -613,7 +633,9 @@ def extract_financial_sections(file_path: str) -> str:
     """Extract only financial-data-relevant sections from a filing.
 
     For HTM: finds tables and paragraphs containing financial keywords.
-    For PDF: extracts pages containing financial keywords.
+    For PDF:
+      - CN filings (path contains CN_Filings) → pdfplumber (better CJK + table extraction)
+      - US/HK filings → PyMuPDF (faster, sufficient for English text)
     Returns a much smaller text than the full filing.
     """
     ext = os.path.splitext(file_path)[1].lower()
@@ -622,6 +644,11 @@ def extract_financial_sections(file_path: str) -> str:
     if ext in (".htm", ".html"):
         return _extract_fin_sections_html(file_path, all_kw)
     elif ext == ".pdf":
+        # Detect CN filing by path (CN_Filings directory)
+        norm_path = os.path.normpath(file_path).replace("\\", "/")
+        _is_cn_filing = "CN_Filings" in norm_path or "cn_filings" in norm_path.lower()
+        if _is_cn_filing:
+            return _extract_fin_sections_pdf_plumber(file_path, all_kw)
         return _extract_fin_sections_pdf(file_path, all_kw)
     else:
         return extract_text(file_path)
@@ -738,6 +765,96 @@ def _extract_fin_sections_pdf(file_path: str, keywords: list) -> str:
     all_text = "\n".join(page.get_text() for page in doc)
     doc.close()
     return all_text[:500000]
+
+
+def _extract_fin_sections_pdf_plumber(file_path: str, keywords: list) -> str:
+    """Extract financial statement pages from a CN annual report PDF using pdfplumber.
+
+    Strategy:
+      1. Scan all pages for CN financial-statement keywords.
+      2. Collect a window of pages around each hit (±1 page for context).
+      3. For hit pages, also run table extraction so structured data
+         (rows/columns) survives as pipe-delimited text for the LLM.
+      4. Falls back to full-text extraction if no keyword hits found.
+
+    Uses pdfplumber instead of PyMuPDF because pdfplumber:
+      - handles CJK character spacing better
+      - provides accurate table bounding-box extraction
+      - avoids glyph-substitution artifacts common in Chinese PDFs
+    """
+    import pdfplumber
+
+    # Keywords that strongly signal the cash-flow / financial-statement section
+    _priority_kw = [
+        "合并现金流量表",
+        "现金流量表",
+        "经营活动产生的现金流量净额",
+        "购建固定资产",
+        "合并资产负债表",
+        "合并利润表",
+        "合并利润及利润分配表",
+        "财务报表",
+        "财务报告",
+    ]
+    all_kw_lower = [kw.lower() for kw in keywords + _priority_kw]
+
+    relevant_page_indices = set()
+
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            total = len(pdf.pages)
+
+            # Pass 1 – find hit pages
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                text_l = text.lower()
+                priority = sum(1 for kw in _priority_kw if kw.lower() in text_l)
+                general  = sum(1 for kw in all_kw_lower if kw in text_l)
+                if priority >= 1 or general >= 2:
+                    # include ±1 page for table-continuation rows
+                    for offset in (-1, 0, 1):
+                        idx = i + offset
+                        if 0 <= idx < total:
+                            relevant_page_indices.add(idx)
+
+            if not relevant_page_indices:
+                # Fallback: return all pages as plain text (truncated)
+                all_text = "\n".join(
+                    page.extract_text() or "" for page in pdf.pages
+                )
+                return all_text[:500_000]
+
+            # Pass 2 – extract text + tables for selected pages
+            parts = []
+            for i in sorted(relevant_page_indices):
+                page = pdf.pages[i]
+                page_text = page.extract_text() or ""
+
+                # Table extraction — pipe-delimited rows for the LLM
+                table_text = ""
+                try:
+                    tables = page.extract_tables() or []
+                    for tbl in tables:
+                        for row in tbl:
+                            if row and any(c for c in row if c):
+                                table_text += (
+                                    " | ".join(
+                                        str(c).strip() if c else "" for c in row
+                                    ) + "\n"
+                                )
+                except Exception:
+                    pass
+
+                block = f"[第 {i + 1} 页]\n{page_text}"
+                if table_text.strip():
+                    block += f"\n\n[表格]\n{table_text}"
+                parts.append(block)
+
+    except Exception:
+        # pdfplumber failed — fall back to PyMuPDF
+        return _extract_fin_sections_pdf(file_path, keywords)
+
+    return "\n\n---\n\n".join(parts)
 
 
 def extract_and_cache_financial_section(file_path: str) -> tuple:
@@ -1274,37 +1391,53 @@ def _build_batch_fcf_prompt_cn(
         for y in year_list[:2]
     )
 
-    return f"""以下是一家A股上市公司的自由现金流表格，部分数据为 N/A，需要从年报中补充。
-请从附件年度报告（合并现金流量表）中，提取以下财年的数据：{years_str}
+    return f"""以下是一家A股上市公司的自由现金流表格，部分数据为 N/A，需要从附件年报中补充。
+请从附件年度报告的【合并现金流量表】中，精确提取以下财年的数据：{years_str}
 
 当前表格（CSV）：
 ```
 {table_csv}
 ```
 
-【字段定义】
-- OCF  = 经营活动产生的现金流量净额
-- CapEx = 购建固定资产、无形资产和其他长期资产支付的现金（取正值）
-- FCF  = OCF − CapEx
+━━━━━━━━━━ 字段定义 ━━━━━━━━━━
+• OCF   = 经营活动产生的现金流量净额
+         （报表行名通常正好是这一行，位于"经营活动现金流量"小节末尾）
+• CapEx = 购建固定资产、无形资产和其他长期资产支付的现金
+         （A股年报标准行名；取正值，因其在报表中已是负数/括号数）
+• FCF   = OCF − CapEx
 
-【返回格式】JSON 数组，每个财年一个对象：
+━━━━━━━━━━ 单位换算（关键！）━━━━━━━━━━
+提取任何数字前，必须先找到该张报表表头或表尾的单位声明：
+  "单位：元" / "单位：人民币元"  → 乘以 1
+  "单位：千元"                  → 乘以 1,000
+  "单位：万元"                  → 乘以 10,000
+  "单位：百万元" / "单位：百万人民币元" → 乘以 1,000,000
+  "单位：亿元"                  → 乘以 100,000,000
+同一份报告中不同报表单位可能不同，每张表单独核查。
+最终所有金额须为【人民币元（CNY）】实际值。
+
+━━━━━━━━━━ A股年报结构提示 ━━━━━━━━━━
+A股年报中，合并现金流量表通常位于"第X节 财务报告"或"财务报表"章节：
+  1. 先找"合并现金流量表"标题
+  2. 在"经营活动产生的现金流量"小节末尾找 OCF
+  3. 在"投资活动产生的现金流量"小节开头找 CapEx（"购建固定资产…支付的现金"）
+  4. 注意：括号表示负数，例如 (1,234,567) = -1,234,567；CapEx 取绝对值
+  5. 若有"母公司现金流量表"和"合并现金流量表"，优先使用【合并】数据
+  6. 年报截止日为 12 月 31 日（即财年与自然年相同）
+
+━━━━━━━━━━ 注意事项 ━━━━━━━━━━
+- CapEx 必须为正数（报表中的现金流出取绝对值）。
+- CapEx 不能为零。若报表无明确行，估算：
+    CapEx ≈ 期末固定资产净值 − 期初固定资产净值 + 本期折旧摊销
+- OCF 为负数是合理的（亏损期或快速扩张期），请仔细核对符号。
+- 只提取年度（全年）数据，不要使用半年报或季报数据。
+- 找不到数据时返回 null，不要猜测。
+
+━━━━━━━━━━ 返回格式 ━━━━━━━━━━
+仅返回 JSON 数组，每个财年一个对象，不得有任何说明文字或 markdown 代码块：
 [{example_obj}, ...]
 
 每个对象必须且仅包含这些键："year"、"OCF"、"CapEx"、"FCF"
-
-★★★ 提取数字前必须核查单位声明 ★★★
-在每张报表的表头找到单位声明，例如：
-  "单位：元" / "单位：人民币元" / "单位：千元" / "单位：万元" / "单位：百万元"
-将所有数字乘以对应单位，换算为【人民币元】的实际金额。
-同一份报告中不同报表可能使用不同单位，每张表单独核查。
-
-注意事项：
-- 所有金额须为换算后的人民币元实际金额。
-- CapEx 必须返回正数（报表中若为负号的现金流出，取绝对值）。
-- CapEx 不能为零。若无明确行，用 (期末固定资产净值 − 期初固定资产净值 + 本期折旧) 估算。
-- OCF 为负数是可能的（亏损/扩张期），请仔细核对符号。
-- 找不到数据时返回 null。
-- 只返回 JSON 数组，不得有任何 markdown 代码块标记或解释文字。
 """
 
 
@@ -1770,7 +1903,7 @@ def fill_fcf_table_with_llm(
 
     if year_filing_pairs:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        n_workers = min(4, len(year_filing_pairs))
+        n_workers = min(12, len(year_filing_pairs))
         log(f"⚡ 并行提取 {len(year_filing_pairs)} 份年报财务章节 (线程数: {n_workers})...")
         results_map = {}
         with ThreadPoolExecutor(max_workers=n_workers) as pool:

@@ -133,16 +133,18 @@ class SmartSECDownloader:
         store.cik = cik
         log_func(f"📡 CIK: {cik} | 正在扫描 SEC 索引...")
 
-        current_year = datetime.now().year
         batches = self._collect_all_submission_batches(cik)
 
         # Phase 1: Register all filings into the index
+        # SEC submissions are in reverse-chronological order, so we see newest first.
         total_registered = 0
+        quarterly_count = 0
+        MAX_QUARTERLY = 4  # only need the most recent 3-4 quarters
         for filings in batches:
             n = len(filings["accessionNumber"])
             for i in range(n):
                 form = filings["form"][i]
-                # We want: all annual (10-K, 20-F) + current-year quarterly (10-Q, 6-K)
+                # We want: all annual (10-K, 20-F) + a few recent quarterly (10-Q, 6-K)
                 is_annual = form in ("10-K", "20-F")
                 is_quarterly = form in ("10-Q", "6-K")
                 if not is_annual and not is_quarterly:
@@ -152,14 +154,11 @@ class SmartSECDownloader:
                 if r_date < "2005-01-01":
                     continue
 
-                # For quarterly, only current year and previous year
+                # For quarterly, keep only the most recent MAX_QUARTERLY filings
                 if is_quarterly:
-                    try:
-                        yr = int(r_date[:4])
-                    except ValueError:
+                    if quarterly_count >= MAX_QUARTERLY:
                         continue
-                    if yr < current_year - 1:
-                        continue
+                    quarterly_count += 1
 
                 acc = filings["accessionNumber"][i]
                 store.register_filing(

@@ -6,6 +6,7 @@ session_id; the @st.fragment polls this dict every 2 seconds.
 """
 
 import threading
+import datetime
 
 # session_id → {"status": "idle"|"running"|"done",
 #                "queue": [...], "idx": int, "logs": [str]}
@@ -41,8 +42,11 @@ def start(session_id: str, market: str, queue: list, gemini_config: dict):
 
     state = _states[session_id]
 
-    def _log(msg: str):
-        state["logs"].append(msg)
+    def _log(msg=None, step=None, total=None):
+        """Accept the same signature as progress_callback in gemini_chat.py."""
+        if msg is not None:
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            state["logs"].append(f"[{ts}] {msg}")
 
     def _worker():
         try:
@@ -98,7 +102,7 @@ def _run_us(state: dict, cfg: dict, log):
             continue
 
         # 3. AI fill
-        data = _ai_fill(data, ticker, "US", cfg, log)
+        data = _ai_fill(data, ticker, "US", cfg, log, state)
 
         # 4. Apply adjusted FCF + persist
         data = MarketAnalyzer._apply_adjusted_fcf(data)
@@ -151,7 +155,7 @@ def _run_cn(state: dict, cfg: dict, log):
             continue
 
         # 3. AI fill
-        data = _ai_fill(data, t, "CN", cfg, log)
+        data = _ai_fill(data, t, "CN", cfg, log, state)
 
         # 4. Apply adjusted FCF + persist
         data = MarketAnalyzer._apply_adjusted_fcf(data)
@@ -165,13 +169,20 @@ def _run_cn(state: dict, cfg: dict, log):
         log(f"✅ {t} 完成")
 
 
-def _ai_fill(data: dict, ticker: str, market: str, cfg: dict, log) -> dict:
+def _ai_fill(data: dict, ticker: str, market: str, cfg: dict, log, state: dict = None) -> dict:
     """Run fill_fcf_table_with_llm headlessly (no Streamlit calls)."""
     from gemini_chat import fill_fcf_table_with_llm, save_fcf_table, recompute_fcf_per_share
 
     fcf_tbl = data.get("fcf_table") if isinstance(data, dict) else None
     if fcf_tbl is None or fcf_tbl.empty or not cfg.get("api_key"):
         return data
+
+    def _table_cb(updated_tbl):
+        """Push each intermediate table update into worker state for the fragment."""
+        if state is not None:
+            state["last_fcf_table"] = updated_tbl
+            state["last_fcf_ticker"] = ticker
+            state["last_fcf_market"] = market
 
     try:
         filled, _, _ = fill_fcf_table_with_llm(
@@ -181,7 +192,7 @@ def _ai_fill(data: dict, ticker: str, market: str, cfg: dict, log) -> dict:
             ticker=ticker,
             market=market,
             progress_callback=log,
-            table_update_callback=None,
+            table_update_callback=_table_cb,
             enabled_models=cfg.get("enabled_models"),
         )
         latest_shares = data.get("shares_outstanding")
@@ -189,6 +200,13 @@ def _ai_fill(data: dict, ticker: str, market: str, cfg: dict, log) -> dict:
             filled = recompute_fcf_per_share(filled, latest_shares)
         data = dict(data)
         data["fcf_table"] = filled
+        # Final update with share-adjusted table
+        if state is not None:
+            state["last_fcf_table"] = filled
+            state["last_fcf_ticker"] = ticker
+            state["last_fcf_market"] = market
+        n_filled = filled["FCF"].notna().sum() if "FCF" in filled.columns else 0
+        log(f"✅ AI 填充完成: {ticker} 共 {n_filled} 行 FCF 数据")
         try:
             save_fcf_table(filled, ticker, market)
         except Exception as e:

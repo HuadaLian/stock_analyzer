@@ -370,6 +370,95 @@ def get_us_data(ticker, years=15):
 #  A-shares (akshare OHLCV + akshare FCF)
 # ═══════════════════════════════════════════════════════════════════════
 
+def _sina_cn_ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch A-share OHLCV from Sina Finance (qfq, fast one-shot download).
+
+    Sina qfq.js row format: date,open,close,high,low,volume,amount
+    Returns standard DataFrame: Date, Open, High, Low, Close, Volume
+    """
+    import requests, re, json
+
+    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+    symbol = f"{prefix}{code}"
+    url = f"https://finance.sina.com.cn/realstock/company/{symbol}/qfq.js"
+
+    r = requests.get(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://finance.sina.com.cn/",
+    }, timeout=20)
+    r.raise_for_status()
+
+    m = re.search(r'=(\{.*\})', r.text, re.DOTALL)
+    if not m:
+        raise ValueError(f"无法解析新浪 qfq.js 响应 (symbol={symbol})")
+
+    raw_rows = json.loads(m.group(1)).get("d", [])
+    if not raw_rows:
+        raise ValueError(f"新浪财经未返回 {symbol} 的历史数据")
+
+    records = []
+    for line in raw_rows:
+        p = line.split(",")
+        if len(p) < 5:
+            continue
+        records.append({
+            "Date":   p[0],
+            "Open":   p[1],
+            "Close":  p[2],   # 新浪格式: date,open,close,high,low,...
+            "High":   p[3],
+            "Low":    p[4],
+            "Volume": p[5] if len(p) > 5 else None,
+        })
+
+    df = pd.DataFrame(records)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+
+    start_dt = pd.to_datetime(start)
+    end_dt   = pd.to_datetime(end)
+    df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)].reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError(f"新浪财经无 {symbol} 在 {start}~{end} 的数据")
+    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+
+
+def _tx_cn_ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch A-share OHLCV from Tencent Finance via akshare (qfq fallback).
+
+    akshare stock_zh_a_hist_tx row format: date,open,close,high,low,amount
+    Returns standard DataFrame: Date, Open, High, Low, Close, Volume
+    """
+    import akshare as ak
+
+    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+    symbol = f"{prefix}{code}"
+
+    # Tencent needs YYYYMMDD dates
+    start_8 = pd.to_datetime(start).strftime("%Y%m%d")
+    end_8   = pd.to_datetime(end).strftime("%Y%m%d")
+
+    raw = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start_8,
+                                  end_date=end_8, adjust="qfq")
+    if raw is None or raw.empty:
+        raise ValueError(f"腾讯财经无 {symbol} 的数据")
+
+    # Tencent columns: date, open, close, high, low, amount
+    df = raw.rename(columns={
+        "date": "Date", "open": "Open", "close": "Close",
+        "high": "High", "low": "Low", "amount": "Volume",
+    })
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+
+
 def _ts_cn_ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
     """Fetch A-share OHLCV from Tushare (forward-adjusted, qfq)."""
     import os, tushare as ts
@@ -405,40 +494,37 @@ def _ts_cn_ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
 
 
 def get_cn_data(code, years=15):
-    """Fetch A-share OHLCV via akshare (primary) / Tushare (fallback); FCF via akshare 新浪报表."""
+    """Fetch A-share OHLCV via 新浪财经 (primary) / 腾讯财经 / Tushare (fallback); FCF via akshare 新浪报表."""
     import akshare as ak
-    import time as _time
 
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=365 * years)).strftime("%Y-%m-%d")
 
-    # ── Primary: akshare (EastMoney) — retry 3× with back-off ───────
+    # ── Primary: 新浪财经 (fast one-shot, all history) ─────────────────
     df = None
-    _ak_err = None
-    for _attempt in range(3):
-        try:
-            raw = ak.stock_zh_a_hist(
-                symbol=code, period="daily",
-                start_date=start, end_date=end, adjust="qfq",
-            )
-            df = raw.rename(columns={
-                "日期": "Date", "开盘": "Open", "最高": "High",
-                "最低": "Low", "收盘": "Close", "成交量": "Volume",
-            })
-            df["Date"] = pd.to_datetime(df["Date"])
-            break
-        except Exception as e:
-            _ak_err = e
-            if _attempt < 2:
-                _time.sleep(2 ** _attempt)  # 1s, 2s back-off
+    _sina_err = _tx_err = _ts_err = None
+    try:
+        df = _sina_cn_ohlcv(code, start, end)
+    except Exception as e:
+        _sina_err = e
 
-    # ── Fallback: Tushare ─────────────────────────────────────────────
+    # ── Fallback 1: 腾讯财经 (via akshare, slower per-year loop) ──────
     if df is None or df.empty:
         try:
-            df = _ts_cn_ohlcv(code, start, end)
-        except Exception as _ts_err:
+            df = _tx_cn_ohlcv(code, start, end)
+        except Exception as e:
+            _tx_err = e
+
+    # ── Fallback 2: Tushare ────────────────────────────────────────────
+    if df is None or df.empty:
+        try:
+            start_8 = start.replace("-", "")
+            end_8   = end.replace("-", "")
+            df = _ts_cn_ohlcv(code, start_8, end_8)
+        except Exception as e:
+            _ts_err = e
             raise ConnectionError(
-                f"获取 {code} K线数据失败 — akshare: {_ak_err} | Tushare: {_ts_err}"
+                f"获取 {code} K线失败 — 新浪: {_sina_err} | 腾讯: {_tx_err} | Tushare: {_ts_err}"
             )
 
     if df is None or df.empty:

@@ -250,19 +250,35 @@ class USAnalyzer(MarketAnalyzer):
             logs  = state["logs"]
             done  = state["status"] == "done"
 
+            st.divider()
             if done:
                 pct = 1.0
                 label_text = f"✅ 批量完成，共 {len(queue)} 只"
+                st.success(label_text)
             else:
                 pct = idx / len(queue) if queue else 0
                 current = queue[idx] if idx < len(queue) else "?"
                 label_text = f"🤖 后台分析中: **{current}** ({idx + 1}/{len(queue)})"
+                st.info(label_text)
 
-            st.progress(pct, text=label_text)
-            if logs:
-                recent = "\n".join(logs[-8:])
-                st.text_area("后台日志 (最近8条)", value=recent, height=160,
-                             key="us_bg_log_area", disabled=True)
+            st.progress(pct)
+
+            n_show = min(len(logs), 20)
+            st.caption(f"📋 后台日志（最近 {n_show}/{len(logs)} 条）")
+            log_text = "\n".join(logs[-20:]) if logs else "（等待日志...）"
+            st.code(log_text, language=None)
+
+            # Show latest AI-filled FCF table if available
+            fcf_tbl = state.get("last_fcf_table")
+            fcf_ticker = state.get("last_fcf_ticker")
+            fcf_market = state.get("last_fcf_market", "US")
+            if fcf_tbl is not None and fcf_ticker:
+                currency = {"US": "USD", "CN": "CNY", "HK": "HKD"}.get(fcf_market, "USD")
+                st.caption(f"📊 最新 AI 填表结果 — {fcf_ticker}")
+                st.markdown(
+                    self._build_fcf_table_html(fcf_tbl, currency),
+                    unsafe_allow_html=True,
+                )
 
             if done:
                 # Keep result visible for one extra cycle, then clear

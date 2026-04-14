@@ -320,6 +320,7 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
         on_select="rerun",
         selection_mode="single-row",
         height=min(420, 38 + len(df) * 35),
+        key=f"rev_{market}_df",
     )
 
     if len(items) > show_limit:
@@ -330,6 +331,7 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
     if sel_rows:
         sel_ticker = visible_items[sel_rows[0]][0]
         if st.session_state.get(f"rev_{market}_ticker") != sel_ticker:
+            data = None
             with st.spinner(f"正在加载 {sel_ticker}..."):
                 data = load_chart(sel_ticker, market)
                 if data is None:
@@ -346,6 +348,11 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
             if data is not None:
                 st.session_state[f"rev_{market}_data"] = data
                 st.session_state[f"rev_{market}_ticker"] = sel_ticker
+                st.rerun()
+            else:
+                st.warning(f"⚠️ 无法加载 {sel_ticker} 的图表，请重试或在对应分析中心重新分析")
+                st.session_state.pop(f"rev_{market}_ticker", None)
+                st.session_state.pop(f"rev_{market}_data", None)
 
     # ── Render chart for selected ticker ─────────────────────────────
     cached_ticker = st.session_state.get(f"rev_{market}_ticker")
@@ -354,6 +361,17 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
         st.divider()
         label = analyzer.format_label(cached_ticker)
         analyzer.render_chart(cached_data, label, show_fcf_table=False)
+
+        # FCF table — shown between chart and price alert
+        fcf_table = cached_data.get("fcf_table")
+        if fcf_table is not None and not fcf_table.empty:
+            currency = cached_data.get("currency", {"US": "USD", "CN": "CNY", "HK": "HKD"}.get(market, "USD"))
+            source = cached_data.get("source", "")
+            st.markdown(
+                analyzer._build_fcf_table_html(fcf_table, currency, source=source),
+                unsafe_allow_html=True,
+            )
+
         analyzer.render_price_alert(cached_ticker, data=cached_data, key_suffix="rev")
 
 
