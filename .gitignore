@@ -280,3 +280,7 @@ CN_Fillings/
 /SEC_Data/facts_0000320193.json
 /SEC_Data/facts_0000920760.json
 /SEC_Data/facts_0001737806.json
+/CN_Filings/*
+/saved_tables/
+/saved_charts
+/SEC_Data

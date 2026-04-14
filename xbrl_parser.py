@@ -271,7 +271,6 @@ def get_fcf_from_xbrl(cik: str):
             "OCF": ocf,
             "CapEx": capex,
             "FCF": fcf,
-            "总股本": shares,
             "每股FCF": fcf_ps,
         })
         if fcf_ps is not None:

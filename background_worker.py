@@ -1,0 +1,199 @@
+"""Background analysis worker.
+
+Runs download → fetch → AI-fill → save in a daemon thread so the Streamlit
+UI thread stays free.  State is stored in a module-level dict keyed by
+session_id; the @st.fragment polls this dict every 2 seconds.
+"""
+
+import threading
+
+# session_id → {"status": "idle"|"running"|"done",
+#                "queue": [...], "idx": int, "logs": [str]}
+_states: dict = {}
+_lock = threading.Lock()
+
+
+# ── Public API ────────────────────────────────────────────────────────
+
+def get_state(session_id: str) -> dict | None:
+    return _states.get(session_id)
+
+
+def is_running(session_id: str) -> bool:
+    s = _states.get(session_id)
+    return s is not None and s["status"] == "running"
+
+
+def clear(session_id: str):
+    with _lock:
+        _states.pop(session_id, None)
+
+
+def start(session_id: str, market: str, queue: list, gemini_config: dict):
+    """Start a background analysis thread for *queue* tickers."""
+    with _lock:
+        _states[session_id] = {
+            "status": "running",
+            "queue": list(queue),
+            "idx": 0,
+            "logs": [],
+        }
+
+    state = _states[session_id]
+
+    def _log(msg: str):
+        state["logs"].append(msg)
+
+    def _worker():
+        try:
+            if market == "US":
+                _run_us(state, gemini_config, _log)
+            elif market == "CN":
+                _run_cn(state, gemini_config, _log)
+        except Exception as e:
+            _log(f"💥 Worker 崩溃: {e}")
+        finally:
+            state["status"] = "done"
+            _log(f"🎉 批量完成，共 {len(state['queue'])} 只。")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+# ── Market workers ────────────────────────────────────────────────────
+
+def _run_us(state: dict, cfg: dict, log):
+    from downloader import SmartSECDownloader
+    from data_provider import get_us_data
+    from gemini_chat import (
+        load_fcf_table, fill_fcf_table_with_llm,
+        save_fcf_table, recompute_fcf_per_share,
+    )
+    from analysis_tracker import mark_analyzed
+    from chart_store import save_chart
+    from analyzers.base import MarketAnalyzer
+
+    queue = state["queue"]
+    for i, ticker in enumerate(queue):
+        state["idx"] = i
+        ticker = ticker.strip().upper()
+        log(f"▶ [{i + 1}/{len(queue)}] {ticker}")
+
+        # 1. Download SEC filings
+        try:
+            dl = SmartSECDownloader(email="lianhdff@gmail.com")
+            dl.smart_download_us(ticker, log)
+        except Exception as e:
+            log(f"⚠️ SEC 下载: {e}")
+
+        # 2. Fetch OHLCV + FCF
+        try:
+            data = get_us_data(ticker)
+            saved_tbl = load_fcf_table(ticker, "US")
+            if saved_tbl is not None and not saved_tbl.empty:
+                data = dict(data)
+                data["fcf_table"] = saved_tbl
+        except Exception as e:
+            log(f"❌ 数据获取失败: {e}")
+            mark_analyzed(ticker, status="error")
+            continue
+
+        # 3. AI fill
+        data = _ai_fill(data, ticker, "US", cfg, log)
+
+        # 4. Apply adjusted FCF + persist
+        data = MarketAnalyzer._apply_adjusted_fcf(data)
+        mcap = data.get("market_cap")
+        mark_analyzed(ticker, metadata={"market_cap": mcap, "market": "US"} if mcap else {"market": "US"})
+        try:
+            save_chart(ticker, "US", data)
+        except Exception as e:
+            log(f"⚠️ 保存图表失败: {e}")
+
+        log(f"✅ {ticker} 完成")
+
+
+def _run_cn(state: dict, cfg: dict, log):
+    from downloader import CninfoDownloader
+    from data_provider import get_cn_data
+    from gemini_chat import (
+        load_fcf_table, fill_fcf_table_with_llm,
+        save_fcf_table, recompute_fcf_per_share,
+    )
+    from analysis_tracker import mark_analyzed
+    from chart_store import save_chart
+    from analyzers.base import MarketAnalyzer
+
+    queue = state["queue"]
+    for i, ticker in enumerate(queue):
+        state["idx"] = i
+        t = ticker.strip()
+        if t.isdigit():
+            t = t.zfill(6)
+        log(f"▶ [{i + 1}/{len(queue)}] {t}")
+
+        # 1. Download 巨潮年报
+        try:
+            dl = CninfoDownloader()
+            dl.download_cn_reports(t, "年度报告", log)
+        except Exception as e:
+            log(f"⚠️ 巨潮下载: {e}")
+
+        # 2. Fetch OHLCV + FCF
+        try:
+            data = get_cn_data(t)
+            saved_tbl = load_fcf_table(t, "CN")
+            if saved_tbl is not None and not saved_tbl.empty:
+                data = dict(data)
+                data["fcf_table"] = saved_tbl
+        except Exception as e:
+            log(f"❌ 数据获取失败: {e}")
+            mark_analyzed(t, status="error")
+            continue
+
+        # 3. AI fill
+        data = _ai_fill(data, t, "CN", cfg, log)
+
+        # 4. Apply adjusted FCF + persist
+        data = MarketAnalyzer._apply_adjusted_fcf(data)
+        mcap = data.get("market_cap")
+        mark_analyzed(t, metadata={"market_cap": mcap, "market": "CN"} if mcap else {"market": "CN"})
+        try:
+            save_chart(t, "CN", data)
+        except Exception as e:
+            log(f"⚠️ 保存图表失败: {e}")
+
+        log(f"✅ {t} 完成")
+
+
+def _ai_fill(data: dict, ticker: str, market: str, cfg: dict, log) -> dict:
+    """Run fill_fcf_table_with_llm headlessly (no Streamlit calls)."""
+    from gemini_chat import fill_fcf_table_with_llm, save_fcf_table, recompute_fcf_per_share
+
+    fcf_tbl = data.get("fcf_table") if isinstance(data, dict) else None
+    if fcf_tbl is None or fcf_tbl.empty or not cfg.get("api_key"):
+        return data
+
+    try:
+        filled, _, _ = fill_fcf_table_with_llm(
+            api_key=cfg["api_key"],
+            model_name=cfg.get("model_name", ""),
+            fcf_table=fcf_tbl.copy(),
+            ticker=ticker,
+            market=market,
+            progress_callback=log,
+            table_update_callback=None,
+            enabled_models=cfg.get("enabled_models"),
+        )
+        latest_shares = data.get("shares_outstanding")
+        if latest_shares and latest_shares > 0:
+            filled = recompute_fcf_per_share(filled, latest_shares)
+        data = dict(data)
+        data["fcf_table"] = filled
+        try:
+            save_fcf_table(filled, ticker, market)
+        except Exception as e:
+            log(f"⚠️ 保存 FCF 表格失败: {e}")
+    except Exception as e:
+        log(f"⚠️ AI 填充出错: {e}")
+
+    return data

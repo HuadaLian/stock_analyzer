@@ -257,9 +257,9 @@ def _add_yf_cross_check(primary_fin, yf_fin):
 def compute_dcf_lines(fcf_per_share_by_year):
     """Compute DCF valuation lines at 14x, 24x, 34x multiples.
 
-    For each annual report year, FCF_0 = mean of up to 5 years' per-share FCF
-    ending at that year.  Returns a DataFrame for marker+dashed line plotting.
-    """
+        For each annual report year, FCF_0 = mean of up to 3 years' per-share FCF
+        ending at that year. Returns a DataFrame for marker+dashed line plotting.
+        """
     if not fcf_per_share_by_year:
         return pd.DataFrame()
 
@@ -267,7 +267,7 @@ def compute_dcf_lines(fcf_per_share_by_year):
     dates, v14, v24, v34 = [], [], [], []
 
     for i, date in enumerate(sorted_dates):
-        start_idx = max(0, i - 4)  # up to 5 years (current + 4 prior)
+        start_idx = max(0, i - 2)  # up to 3 years (current + 2 prior)
         window = sorted_dates[start_idx : i + 1]
         avg_fcf = np.mean([fcf_per_share_by_year[d] for d in window])
 
@@ -369,25 +369,80 @@ def get_us_data(ticker, years=15):
 # ═══════════════════════════════════════════════════════════════════════
 #  A-shares (akshare OHLCV + akshare FCF)
 # ═══════════════════════════════════════════════════════════════════════
+
+def _ts_cn_ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
+    """Fetch A-share OHLCV from Tushare (forward-adjusted, qfq)."""
+    import os, tushare as ts
+
+    token = os.environ.get("TUSHARE_TOKEN", "")
+    if not token:
+        try:
+            env_path = os.path.join(os.path.dirname(__file__), ".env")
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("TUSHARE_TOKEN="):
+                        token = line.split("=", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+    if not token:
+        raise RuntimeError("TUSHARE_TOKEN 未设置，无法使用 Tushare 备用数据源")
+
+    ts.set_token(token)
+    ts_code = f"{code}.SH" if code.startswith(("6", "9")) else f"{code}.SZ"
+    df = ts.pro_bar(ts_code=ts_code, start_date=start, end_date=end, adj="qfq")
+    if df is None or df.empty:
+        raise ValueError(f"Tushare 未返回 {code} 的数据")
+
+    df = df.rename(columns={
+        "trade_date": "Date", "open": "Open", "high": "High",
+        "low": "Low", "close": "Close", "vol": "Volume",
+    })
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").reset_index(drop=True)
+    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+
+
 def get_cn_data(code, years=15):
-    """Fetch A-share OHLCV via akshare; FCF via akshare 新浪报表."""
+    """Fetch A-share OHLCV via akshare (primary) / Tushare (fallback); FCF via akshare 新浪报表."""
     import akshare as ak
+    import time as _time
 
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
 
-    df = ak.stock_zh_a_hist(
-        symbol=code, period="daily",
-        start_date=start, end_date=end, adjust="qfq",
-    )
-    if df.empty:
-        raise ValueError(f"未找到 {code} 的历史数据")
+    # ── Primary: akshare (EastMoney) — retry 3× with back-off ───────
+    df = None
+    _ak_err = None
+    for _attempt in range(3):
+        try:
+            raw = ak.stock_zh_a_hist(
+                symbol=code, period="daily",
+                start_date=start, end_date=end, adjust="qfq",
+            )
+            df = raw.rename(columns={
+                "日期": "Date", "开盘": "Open", "最高": "High",
+                "最低": "Low", "收盘": "Close", "成交量": "Volume",
+            })
+            df["Date"] = pd.to_datetime(df["Date"])
+            break
+        except Exception as e:
+            _ak_err = e
+            if _attempt < 2:
+                _time.sleep(2 ** _attempt)  # 1s, 2s back-off
 
-    df = df.rename(columns={
-        "日期": "Date", "开盘": "Open", "最高": "High",
-        "最低": "Low", "收盘": "Close", "成交量": "Volume",
-    })
-    df["Date"] = pd.to_datetime(df["Date"])
+    # ── Fallback: Tushare ─────────────────────────────────────────────
+    if df is None or df.empty:
+        try:
+            df = _ts_cn_ohlcv(code, start, end)
+        except Exception as _ts_err:
+            raise ConnectionError(
+                f"获取 {code} K线数据失败 — akshare: {_ak_err} | Tushare: {_ts_err}"
+            )
+
+    if df is None or df.empty:
+        raise ValueError(f"未找到 {code} 的历史数据")
 
     # Financial data via akshare 新浪现金流量表
     fin = _ak_fcf_data(code)

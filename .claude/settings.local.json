@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import gemini_chat; print\\('gemini_chat OK'\\); import analyzers.cn; print\\('cn.py OK'\\)\")",
+      "Bash(python -c \"import gemini_chat; print\\('gemini_chat OK'\\)\")",
+      "Bash(ls /c/Users/huada/stock_analyzer/saved_tables/*.txt)",
+      "Bash(/c/Users/huada/miniconda3/envs/stock_analyzer/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); import gemini_chat; print\\('OK'\\)\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import gemini_chat; print\\('OK'\\)\")",
+      "Bash(where python:*)"
+    ]
+  }
+}

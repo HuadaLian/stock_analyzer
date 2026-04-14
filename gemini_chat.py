@@ -8,7 +8,9 @@ import pandas as pd
 import numpy as np
 from google import genai
 from google.genai import types
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+import warnings
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 BASE_DIR = os.path.dirname(__file__)
 RULES_PATH = os.path.join(BASE_DIR, "prompts", "fcf_extraction_rules.txt")
@@ -16,69 +18,58 @@ RULES_PATH = os.path.join(BASE_DIR, "prompts", "fcf_extraction_rules.txt")
 # Available free-tier models from Google AI Studio (April 2026)
 # Organized by category matching the rate-limit dashboard
 MODELS = {
-    # ── Gemini Text-out models ────────────────────────────────────────
-    "gemini-2.5-flash":      "Gemini 2.5 Flash",
-    "gemini-2.5-pro":        "Gemini 2.5 Pro",
-    "gemini-2.0-flash":      "Gemini 2 Flash",
-    "gemini-2.0-flash-lite": "Gemini 2 Flash Lite",
-    "gemini-3-flash":        "Gemini 3 Flash",
-    "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
-    "gemini-3.1-pro":        "Gemini 3.1 Pro",
-    "gemini-2.5-flash-lite": "Gemini 2.5 Flash Lite",
-    # ── Gemma 4 系列 (Other models, 无限 TPM) ────────────────────────
-    "gemma-4-26b-it":        "Gemma 4 26B",
+    # ── Gemma 4 系列 (主力, unlimited TPM) ──────────────────────────
     "gemma-4-31b-it":        "Gemma 4 31B",
-    # ── Gemma 3 系列 (Other models, 15K TPM 限制) ────────────────────
+    "gemma-4-26b-it":        "Gemma 4 26B",
+    # ── Gemma 3 系列 (仅保留 27B) ───────────────────────────────────
     "gemma-3-27b-it":        "Gemma 3 27B",
-    "gemma-3-12b-it":        "Gemma 3 12B",
-    "gemma-3-4b-it":         "Gemma 3 4B",
-    "gemma-3-2b-it":         "Gemma 3 2B",
-    "gemma-3-1b-it":         "Gemma 3 1B",
+    # ── Gemini 系列 (最后备用, 便宜优先) ────────────────────────────
+    "gemini-2.0-flash-lite": "Gemini 2 Flash Lite",
+    "gemini-2.5-flash-lite": "Gemini 2.5 Flash Lite",
+    "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite",
+    "gemini-2.0-flash":      "Gemini 2 Flash",
+    "gemini-3-flash":        "Gemini 3 Flash",
+    "gemini-2.5-flash":      "Gemini 2.5 Flash",
+    "gemini-3.1-pro":        "Gemini 3.1 Pro",
+    "gemini-2.5-pro":        "Gemini 2.5 Pro",
 }
 
-# Rate limits per model (RPM, TPM, RPD) from Google AI Studio free tier
+# Rate limits per model (RPM, TPM, RPD) — paid Google AI Studio tier
 # tpm = -1 means unlimited, tpm/rpm/rpd = 0 means no quota available
 MODEL_RATE_LIMITS = {
-    # Gemini Text-out
-    "gemini-2.5-flash":      {"rpm": 5,  "tpm": 250_000,  "rpd": 20,    "category": "Text-out"},
-    "gemini-2.5-pro":        {"rpm": 5,  "tpm": 250_000,  "rpd": 25,    "category": "Text-out"},
-    "gemini-2.0-flash":      {"rpm": 15, "tpm": 500_000,  "rpd": 50,    "category": "Text-out"},
-    "gemini-2.0-flash-lite": {"rpm": 15, "tpm": 500_000,  "rpd": 50,    "category": "Text-out"},
-    "gemini-3-flash":        {"rpm": 5,  "tpm": 250_000,  "rpd": 20,    "category": "Text-out"},
-    "gemini-3.1-flash-lite": {"rpm": 15, "tpm": 250_000,  "rpd": 500,   "category": "Text-out"},
-    "gemini-3.1-pro":        {"rpm": 5,  "tpm": 250_000,  "rpd": 25,    "category": "Text-out"},
-    "gemini-2.5-flash-lite": {"rpm": 10, "tpm": 250_000,  "rpd": 20,    "category": "Text-out"},
-    # Gemma 4
-    "gemma-4-26b-it":        {"rpm": 15, "tpm": -1,       "rpd": 1_500, "category": "Other"},
-    "gemma-4-31b-it":        {"rpm": 15, "tpm": -1,       "rpd": 1_500, "category": "Other"},
-    # Gemma 3
-    "gemma-3-27b-it":        {"rpm": 30, "tpm": 15_000,   "rpd": 14_400, "category": "Other"},
-    "gemma-3-12b-it":        {"rpm": 30, "tpm": 15_000,   "rpd": 14_400, "category": "Other"},
-    "gemma-3-4b-it":         {"rpm": 30, "tpm": 15_000,   "rpd": 14_400, "category": "Other"},
-    "gemma-3-2b-it":         {"rpm": 30, "tpm": 15_000,   "rpd": 14_400, "category": "Other"},
-    "gemma-3-1b-it":         {"rpm": 30, "tpm": 15_000,   "rpd": 14_400, "category": "Other"},
+    # ── Gemma 4 (paid: unlimited TPM) ───────────────────────────────
+    "gemma-4-31b-it":        {"rpm": 30, "tpm": -1,       "rpd": 14_400, "category": "Gemma4"},
+    "gemma-4-26b-it":        {"rpm": 30, "tpm": -1,       "rpd": 14_400, "category": "Gemma4"},
+    # ── Gemma 3 27B (paid) ──────────────────────────────────────────
+    "gemma-3-27b-it":        {"rpm": 60, "tpm": 30_000,   "rpd": 14_400, "category": "Gemma3"},
+    # ── Gemini (paid, cheapest → most expensive) ─────────────────────
+    "gemini-2.0-flash-lite": {"rpm": 30, "tpm": 1_000_000, "rpd": 1_500, "category": "Gemini"},
+    "gemini-2.5-flash-lite": {"rpm": 30, "tpm": 1_000_000, "rpd": 1_500, "category": "Gemini"},
+    "gemini-3.1-flash-lite": {"rpm": 30, "tpm": 1_000_000, "rpd": 1_500, "category": "Gemini"},
+    "gemini-2.0-flash":      {"rpm": 30, "tpm": 1_000_000, "rpd": 1_500, "category": "Gemini"},
+    "gemini-3-flash":        {"rpm": 15, "tpm": 1_000_000, "rpd": 1_500, "category": "Gemini"},
+    "gemini-2.5-flash":      {"rpm": 15, "tpm": 1_000_000, "rpd": 1_500, "category": "Gemini"},
+    "gemini-3.1-pro":        {"rpm": 10, "tpm": 1_000_000, "rpd": 1_500, "category": "Gemini"},
+    "gemini-2.5-pro":        {"rpm": 10, "tpm": 1_000_000, "rpd": 1_500, "category": "Gemini"},
 }
 
-# Default enabled models for rotation (ordered by capability, best first)
+# Default enabled models for rotation
+# Priority: Gemma 4 first → Gemma 3 27B → Gemini cheap→expensive
 DEFAULT_ENABLED_MODELS = [
-    # ── Gemini — 最强能力 ────────────────────────────────────────────
-    "gemini-2.5-pro",        # 最强, 高智, 少配额
-    "gemini-2.5-flash",      # 快速且能力强
-    "gemini-3.1-pro",        # 新一代 Pro
-    "gemini-3-flash",        # 新一代 Flash
-    "gemini-3.1-flash-lite", # 新一代 Flash Lite
-    "gemini-2.5-flash-lite", # 2.5 Flash 轻量版
-    "gemini-2.0-flash",      # 上一代 Flash
-    "gemini-2.0-flash-lite", # 上一代 Flash Lite
-    # ── Gemma 4 — 无限 TPM, 大模型 ────────────────────────────────
-    "gemma-4-31b-it",        # Gemma 4 最大
-    "gemma-4-26b-it",        # Gemma 4 较大
-    # ── Gemma 3 — 低 TPM (15K), 最后備用 ──────────────────────────
+    # ── Gemma 4 — 主力 (unlimited TPM) ──────────────────────────────
+    "gemma-4-31b-it",        # 主力: Gemma 4 最大
+    "gemma-4-26b-it",        # 备用: Gemma 4 较大
+    # ── Gemma 3 27B — 先于所有 Gemini ───────────────────────────────
     "gemma-3-27b-it",
-    "gemma-3-12b-it",
-    "gemma-3-4b-it",
-    "gemma-3-2b-it",
-    "gemma-3-1b-it",
+    # ── Gemini — 最后备用, 便宜优先 ─────────────────────────────────
+    "gemini-2.0-flash-lite", # 最便宜
+    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-3.1-pro",
+    "gemini-2.5-pro",        # 最贵
 ]
 
 # ── Model call status — persisted to disk ─────────────────────────────
@@ -204,36 +195,48 @@ def _record_model_error(model_id: str, elapsed: float, err_msg: str):
     import time as _t
     today = pd.Timestamp.now().strftime("%Y-%m-%d")
     prev = _model_call_status.get(model_id, {})
+    # Treat explicit NOT_FOUND / 404 as a permanent unavailability for today
+    em = (err_msg or "").lower()
+    if "not found" in em or "404" in em or "not_found" in em:
+        status = "not_found"
+        # avoid retrying the same invalid model for 24h
+        cooldown_until = int(_t.time() + 86400)
+        detail = f"❌ NOT_FOUND: {err_msg[:120]}"
+    else:
+        status = "error"
+        cooldown_until = 0
+        detail = f"❌ {err_msg[:120]}"
+
     _model_call_status[model_id] = {
-        "status": "error", "time": _t.time(), "date": today,
-        "detail": f"❌ {err_msg[:80]}",
+        "status": status, "time": _t.time(), "date": today,
+        "detail": detail,
         "calls_today": prev.get("calls_today", 0),
         "tokens_today": prev.get("tokens_today", 0),
         "consecutive_429": 0,
-        "cooldown_until": 0,
+        "cooldown_until": cooldown_until,
     }
     _save_model_status()
 
 
 # ── Model priority & token budget ─────────────────────────────────────
 
-# Explicit capability rank — lower number = higher capability
+# Explicit rotation rank — lower number = tried first
+# Gemma 4 → Gemma 3 27B → Gemini cheap→expensive
 _MODEL_CAPABILITY_RANK = {
-    "gemini-2.5-pro":        0,
-    "gemini-2.5-flash":      1,
-    "gemini-3.1-pro":        2,
-    "gemini-3-flash":        3,
-    "gemini-3.1-flash-lite": 4,
-    "gemini-2.5-flash-lite": 5,
+    # ── Gemma 4 — 主力 ───────────────────────────────────────────────
+    "gemma-4-31b-it":        0,
+    "gemma-4-26b-it":        1,
+    # ── Gemma 3 27B ─────────────────────────────────────────────────
+    "gemma-3-27b-it":        2,
+    # ── Gemini — 便宜优先 ────────────────────────────────────────────
+    "gemini-2.0-flash-lite": 3,
+    "gemini-2.5-flash-lite": 4,
+    "gemini-3.1-flash-lite": 5,
     "gemini-2.0-flash":      6,
-    "gemini-2.0-flash-lite": 7,
-    "gemma-4-31b-it":        8,
-    "gemma-4-26b-it":        9,
-    "gemma-3-27b-it":        10,
-    "gemma-3-12b-it":        11,
-    "gemma-3-4b-it":         12,
-    "gemma-3-2b-it":         13,
-    "gemma-3-1b-it":         14,
+    "gemini-3-flash":        7,
+    "gemini-2.5-flash":      8,
+    "gemini-3.1-pro":        9,
+    "gemini-2.5-pro":        10,
 }
 
 
@@ -256,9 +259,11 @@ def _get_model_token_budget(model_id: str) -> int:
     - No quota: 0
     """
     if model_id.startswith("gemma-4"):
-        return 220_000
+        # Allow Gemma-4 to handle larger requests; API hard limit ≈262k
+        return 240_000
     if model_id.startswith("gemma-3"):
-        return 12_000
+        # Paid tier: 30K TPM → 24K budget (80%)
+        return 24_000
 
     lim = MODEL_RATE_LIMITS.get(model_id, {})
     tpm = lim.get("tpm", 0)
@@ -268,6 +273,40 @@ def _get_model_token_budget(model_id: str) -> int:
     if tpm == -1 or tpm >= 200_000:
         return _MAX_TOKENS_PER_REQUEST
     return int(tpm * 0.8)
+
+
+def _normalize_model_id(model_name: str) -> str:
+    """Normalize user-provided model names to known model ids.
+
+    Accepts common misspellings or human-friendly names like
+    "gemme 4 26b" or "Gemma 4 26B" and returns the canonical id
+    defined in `MODELS` (e.g. "gemma-4-26b-it"). If no mapping
+    is found, returns the original input.
+    """
+    if not model_name:
+        return model_name
+    m = model_name.strip().lower()
+    # Fix common typos
+    m = m.replace("gemme", "gemma")
+    m = m.replace(" ", "-")
+    m = m.replace("..", "-")
+
+    # Direct prefix match
+    for k in MODELS.keys():
+        if k.startswith(m) or k == m:
+            return k
+
+    # Pattern-based heuristics
+    if "4" in m and ("26" in m or "26b" in m):
+        return "gemma-4-26b-it"
+    if "4" in m and ("31" in m or "31b" in m):
+        return "gemma-4-31b-it"
+    if "2.5" in m and "pro" in m:
+        return "gemini-2.5-pro"
+    if "2.5" in m and "flash" in m:
+        return "gemini-2.5-flash"
+
+    return model_name
 
 
 def _is_model_available(model_id: str) -> bool:
@@ -326,11 +365,32 @@ FCF_SYSTEM_PROMPT = (
     "Always return valid JSON. Never include commentary outside the JSON."
 )
 
+# CN-specific system prompt (Chinese, A-share annual reports)
+FCF_SYSTEM_PROMPT_CN = (
+    "你是一个专业的财务数据提取专家。"
+    "你阅读A股上市公司年度报告，并从【合并现金流量表】中精确提取现金流数据。\n\n"
+    "★★★ 关键规则 — 单位声明 ★★★\n"
+    "在提取任何数字之前，必须先找到报表表头的单位声明，例如：\n"
+    "  '单位：元'、'单位：人民币元'、'单位：千元'、'单位：万元'、'单位：百万元'\n"
+    "将所有数字乘以对应单位，换算为【人民币元】的实际金额。\n"
+    "示例：单位：万元，看到 12,345 → 实际金额 = 123,450,000 元。\n"
+    "同一份报告中不同报表的单位可能不同，每张报表需单独核查。\n\n"
+    "★★★ 关键字段定义 ★★★\n"
+    "  OCF  = 经营活动产生的现金流量净额\n"
+    "  CapEx = 购建固定资产、无形资产和其他长期资产支付的现金（取正值）\n"
+    "  FCF  = OCF − CapEx\n\n"
+    "必须返回合法 JSON 数组，JSON 之外不得有任何说明文字。"
+)
+
+
+def _is_gemma_model(model_id: str) -> bool:
+    """Return True if the model is any Gemma variant."""
+    return (model_id or "").startswith("gemma-")
+
 _DEFAULT_RULES = """## 提取字段
 1. OCF: "Net cash provided by operating activities" / "经营活动产生的现金流量净额"
 2. CapEx: "Purchases of property and equipment" / "购建固定资产..." — 返回正数
 3. FCF = OCF - CapEx
-4. 每股FCF
 """
 
 
@@ -457,6 +517,34 @@ def list_cn_filings(code: str) -> list:
     return results
 
 
+def list_hk_filings(code: str) -> list:
+    """List all downloaded HK filings for a Hong Kong stock code."""
+    results = []
+    hk_dir = os.path.join(BASE_DIR, "HK_Filings", code)
+    if not os.path.isdir(hk_dir):
+        return results
+
+    for fname in sorted(os.listdir(hk_dir), reverse=True):
+        fpath = os.path.join(hk_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        if not fname.endswith((".pdf", ".htm", ".html", ".txt")):
+            continue
+        if "_financial" in fname:
+            continue
+        is_annual = (
+            "年度报告" in fname or "年报" in fname
+            or "annual" in fname.lower()
+        )
+        results.append({
+            "label": fname,
+            "path": fpath,
+            "form": "年报" if is_annual else "中期报告",
+            "is_annual": is_annual,
+        })
+    return results
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Gemini chat session
 # ═══════════════════════════════════════════════════════════════════════
@@ -467,6 +555,8 @@ def init_chat(api_key: str, model_name: str, filing_texts: list):
     filing_texts: list of (label, text) tuples.
     Returns: (client, chat) tuple.
     """
+    # Normalize model id (tolerate human-friendly names / typos)
+    model_name = _normalize_model_id(model_name)
     client = genai.Client(api_key=api_key)
 
     # Build the context message with all selected filings
@@ -514,7 +604,8 @@ _FIN_KEYWORDS_CN = [
     "现金流", "经营活动", "投资活动", "筹资活动",
     "资本支出", "自由现金流", "净额", "折旧", "摊销",
     "资产负债", "总资产", "负债合计", "股东权益",
-    "总股本", "营业收入", "净利润", "合并报表",
+    "营业收入", "净利润", "合并报表",
+    # 注意：不含 "总股本"，避免提取股本数据并触发额外验证请求
 ]
 
 
@@ -540,7 +631,11 @@ def _extract_fin_sections_html(file_path: str, keywords: list) -> str:
     """Extract financial tables and surrounding context from HTML filings."""
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         html = f.read()
-    soup = BeautifulSoup(html, "html.parser")
+    # lxml is ~10x faster than html.parser for large SEC filings
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "meta", "link"]):
         tag.decompose()
 
@@ -574,6 +669,50 @@ def _extract_fin_sections_html(file_path: str, keywords: list) -> str:
         full = soup.get_text(separator="\n", strip=True)
         result = full[:500000]  # ~125k tokens max
     return result
+
+
+def split_html_into_chapters(file_path: str) -> dict:
+    """Split an HTML filing into topical chapters based on headings.
+
+    Returns mapping {slug: text}. Slug is short and safe for filenames.
+    """
+    from pathlib import Path
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        html = f.read()
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "meta", "link"]):
+        tag.decompose()
+
+    chapters = []
+    # Find headings and capture following nodes until next heading
+    headings = soup.find_all(["h1", "h2", "h3", "h4", "h5"])
+    if not headings:
+        # fallback: one chapter with full text
+        return {"full": soup.get_text(separator="\n", strip=True)}
+
+    for i, h in enumerate(headings):
+        title = h.get_text(strip=True)
+        parts = []
+        # include the heading
+        parts.append(title)
+        node = h.next_sibling
+        while node:
+            if getattr(node, "name", None) and node.name in ("h1", "h2", "h3", "h4", "h5"):
+                break
+            text = node.get_text(strip=True) if hasattr(node, "get_text") else str(node)
+            if text:
+                parts.append(text)
+            node = node.next_sibling
+        chapters.append((title, "\n\n".join(parts)))
+
+    # Build slugs and return dict
+    out = {}
+    base = Path(file_path).stem
+    for idx, (title, text) in enumerate(chapters, start=1):
+        slug = re.sub(r"[^0-9A-Za-z_-]", "_", title.strip())[:60] or f"sec{idx}"
+        key = f"{base}_sec{idx}_{slug}"
+        out[key] = text
+    return out
 
 
 def _extract_fin_sections_pdf(file_path: str, keywords: list) -> str:
@@ -625,7 +764,11 @@ def extract_and_cache_financial_section(file_path: str) -> tuple:
 
 
 def estimate_and_cache_full_tokens(file_path: str) -> int:
-    """Estimate full-report tokens and cache the numeric result."""
+    """Estimate full-report tokens and cache the numeric result.
+
+    Uses file-size as a fast heuristic for uncached files (~5 bytes per token),
+    avoiding the need to read and parse the entire filing on first call.
+    """
     rel = os.path.relpath(file_path, BASE_DIR)
     cache_name = os.path.splitext(rel)[0] + "_full_tokens.json"
     cache_path = os.path.join(BASE_DIR, "cache", cache_name)
@@ -638,8 +781,12 @@ def estimate_and_cache_full_tokens(file_path: str) -> int:
         except (OSError, ValueError, json.JSONDecodeError):
             pass
 
-    full_text = extract_text(file_path)
-    tokens = estimate_tokens(full_text)
+    # Fast heuristic: file size / 5 ≈ tokens (avoids reading entire file)
+    try:
+        tokens = os.path.getsize(file_path) // 5
+    except OSError:
+        tokens = 0
+
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     try:
         with open(cache_path, "w", encoding="utf-8") as f:
@@ -1064,7 +1211,7 @@ def _build_batch_fcf_prompt(
     """Build a prompt asking Gemini to extract FCF data for MULTIPLE years at once."""
     years_str = ", ".join(str(y) for y in year_list)
     example_obj = ', '.join(
-        f'{{"year": {y}, "OCF": ..., "CapEx": ..., "FCF": ..., "每股FCF": ...}}'
+        f'{{"year": {y}, "OCF": ..., "CapEx": ..., "FCF": ...}}'
         for y in year_list[:2]
     )
 
@@ -1089,8 +1236,7 @@ Current table (CSV):
 Return a JSON ARRAY with one object per year:
 [{example_obj}, ...]
 
-Each object MUST have these exact keys:
-    "year", "OCF", "CapEx", "FCF", "每股FCF"
+Each object MUST have these exact keys: "year", "OCF", "CapEx", "FCF"
 
 ★★★ BEFORE EXTRACTING ANY NUMBER ★★★
 For EVERY financial table you read, FIRST locate the UNIT DECLARATION line at the top of that
@@ -1108,10 +1254,57 @@ IMPORTANT:
   "Payments for property, plant and equipment", or similar items.
   If truly not found, ESTIMATE CapEx = (ending net PP&E − beginning net PP&E + depreciation).
   Never return 0 for CapEx without explanation.
-- Negative OCF is possible but unusual. If OCF is negative, double-check the sign and
-  make sure you are reading "Net cash provided by / used in operating activities" correctly.
+- Negative OCF is possible but unusual. Double-check the sign convention.
 - If you cannot find a value, use null.
 - Return ONLY the JSON array, no markdown fences, no explanation.
+"""
+
+
+def _build_batch_fcf_prompt_cn(
+    table_csv: str,
+    year_list: list[int],
+) -> str:
+    """Build a CN-specific prompt for A-share annual reports.
+
+    Uses Chinese field names, CNY unit rules, no 每股FCF (computed locally).
+    """
+    years_str = "、".join(str(y) for y in year_list)
+    example_obj = ', '.join(
+        f'{{"year": {y}, "OCF": ..., "CapEx": ..., "FCF": ...}}'
+        for y in year_list[:2]
+    )
+
+    return f"""以下是一家A股上市公司的自由现金流表格，部分数据为 N/A，需要从年报中补充。
+请从附件年度报告（合并现金流量表）中，提取以下财年的数据：{years_str}
+
+当前表格（CSV）：
+```
+{table_csv}
+```
+
+【字段定义】
+- OCF  = 经营活动产生的现金流量净额
+- CapEx = 购建固定资产、无形资产和其他长期资产支付的现金（取正值）
+- FCF  = OCF − CapEx
+
+【返回格式】JSON 数组，每个财年一个对象：
+[{example_obj}, ...]
+
+每个对象必须且仅包含这些键："year"、"OCF"、"CapEx"、"FCF"
+
+★★★ 提取数字前必须核查单位声明 ★★★
+在每张报表的表头找到单位声明，例如：
+  "单位：元" / "单位：人民币元" / "单位：千元" / "单位：万元" / "单位：百万元"
+将所有数字乘以对应单位，换算为【人民币元】的实际金额。
+同一份报告中不同报表可能使用不同单位，每张表单独核查。
+
+注意事项：
+- 所有金额须为换算后的人民币元实际金额。
+- CapEx 必须返回正数（报表中若为负号的现金流出，取绝对值）。
+- CapEx 不能为零。若无明确行，用 (期末固定资产净值 − 期初固定资产净值 + 本期折旧) 估算。
+- OCF 为负数是可能的（亏损/扩张期），请仔细核对符号。
+- 找不到数据时返回 null。
+- 只返回 JSON 数组，不得有任何 markdown 代码块标记或解释文字。
 """
 
 
@@ -1425,12 +1618,15 @@ def fill_fcf_table_with_llm(
     Returns: (filled_table, log_messages, prompt_info)
         prompt_info: dict with system_prompt, rules, rules_path, batch_prompts
     """
+    # Normalize model id to be tolerant of user input
+    model_name = _normalize_model_id(model_name)
     client = genai.Client(api_key=api_key)
     fcf_table = _sanitize_fcf_table_columns(fcf_table)
     _enabled = enabled_models or DEFAULT_ENABLED_MODELS
     logs = []
+    _is_cn_market = (market or "").upper() == "CN"
     prompt_info = {
-        "system_prompt": FCF_SYSTEM_PROMPT,
+        "system_prompt": FCF_SYSTEM_PROMPT_CN if _is_cn_market else FCF_SYSTEM_PROMPT,
         "rules": load_fcf_rules(),
         "rules_path": RULES_PATH,
         "batch_prompts": [],
@@ -1444,6 +1640,8 @@ def fill_fcf_table_with_llm(
     # ── List available annual filings ─────────────────────────────────
     if market == "US":
         filings = list_sec_filings(ticker)
+    elif market == "HK":
+        filings = list_hk_filings(ticker)
     else:
         filings = list_cn_filings(ticker)
 
@@ -1550,30 +1748,52 @@ def fill_fcf_table_with_llm(
     year_filing_text = {}  # year -> (fin_text, tokens, label)
     token_rows = []
 
+    # Collect (year, filing) pairs; log missing immediately
+    year_filing_pairs = []
     for year in years_to_extract:
         filing = _find_filing_for_year(year, annual_filings)
         if not filing:
             if year in all_years_to_fill:
                 log(f"⚠️ {year}: 未找到对应年报，跳过")
             continue
+        year_filing_pairs.append((year, filing))
+
+    def _extract_one(year_filing):
+        """Worker: extract financial section + estimate tokens (no Streamlit calls)."""
+        year, filing = year_filing
         try:
             fin_text, tokens = extract_and_cache_financial_section(filing["path"])
-            # Cap per-filing tokens
+            full_tokens = estimate_and_cache_full_tokens(filing["path"])
+            return year, fin_text, tokens, full_tokens, filing["label"], None
+        except Exception as e:
+            return year, None, 0, 0, filing["label"], str(e)
+
+    if year_filing_pairs:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        n_workers = min(4, len(year_filing_pairs))
+        log(f"⚡ 并行提取 {len(year_filing_pairs)} 份年报财务章节 (线程数: {n_workers})...")
+        results_map = {}
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            future_to_year = {
+                pool.submit(_extract_one, yf): yf[0]
+                for yf in year_filing_pairs
+            }
+            for fut in as_completed(future_to_year):
+                yr, fin_text, tokens, full_tokens, label, err = fut.result()
+                results_map[yr] = (fin_text, tokens, full_tokens, label, err)
+
+        # Reassemble in year-descending order (preserve original ordering)
+        for year, _ in sorted(year_filing_pairs, key=lambda x: -x[0]):
+            fin_text, tokens, full_tokens, label, err = results_map[year]
+            if err:
+                log(f"❌ {year}: 文件读取失败: {err}")
+                continue
             if tokens > _MAX_TOKENS_PER_FILING:
                 fin_text = fin_text[:_MAX_TOKENS_PER_FILING * 4]
                 tokens = _MAX_TOKENS_PER_FILING
-            token_rows.append({
-                "year": year, "kind": "节选", "tokens": tokens,
-                "label": filing["label"],
-            })
-            full_tokens = estimate_and_cache_full_tokens(filing["path"])
-            token_rows.append({
-                "year": year, "kind": "完整", "tokens": full_tokens,
-                "label": filing["label"],
-            })
-            year_filing_text[year] = (fin_text, tokens, filing["label"])
-        except Exception as e:
-            log(f"❌ {year}: 文件读取失败: {e}")
+            token_rows.append({"year": year, "kind": "节选", "tokens": tokens, "label": label})
+            token_rows.append({"year": year, "kind": "完整", "tokens": full_tokens, "label": label})
+            year_filing_text[year] = (fin_text, tokens, label)
 
     _kind_rank = {"节选": 0, "完整": 1}
     _log_token_estimate_table(
@@ -1593,6 +1813,16 @@ def fill_fcf_table_with_llm(
     if batch_token_budget != _MAX_TOKENS_PER_REQUEST:
         log(f"🎯 批量预算: ~{batch_token_budget:,} tokens (基于最佳可用模型)")
 
+    # ── Gemma constraint: 1 filing per request ────────────────────────
+    # Gemma models work best (and avoid context issues) with a single
+    # annual report per request, regardless of token budget.
+    _primary_model = _normalize_model_id(model_name) if model_name else (
+        _enabled[0] if _enabled else ""
+    )
+    _max_years_per_batch = 1 if _is_gemma_model(_primary_model) else _MAX_ANNUAL_FILINGS
+    if _max_years_per_batch == 1:
+        log(f"📌 Gemma 模型限制: 每次请求仅发送 1 份年报 (模型: {_primary_model})")
+
     # ── Group years into batches (only years needing fill) ────────────
     _fill_year_set = set(all_years_to_fill)
     batches = []   # each batch: list of (year, fin_text, label)
@@ -1605,7 +1835,9 @@ def fill_fcf_table_with_llm(
             continue
         fin_text, tokens, label = year_filing_text[year]
 
-        if current_tokens + tokens + prompt_overhead > batch_token_budget and current_batch:
+        if (len(current_batch) >= _max_years_per_batch
+                or (current_tokens + tokens + prompt_overhead > batch_token_budget)
+                ) and current_batch:
             batches.append(current_batch)
             current_batch = []
             current_tokens = 0
@@ -1634,11 +1866,19 @@ def fill_fcf_table_with_llm(
             progress_callback(None, processed, total_years)
 
         # Build contents: all filing texts + one prompt
+        _is_cn = (market or "").upper() == "CN"
         parts = []
         for year, fin_text, label in batch:
-            parts.append(types.Part(text=f"═══ Annual report: {label} (Fiscal Year {year}) ═══\n\n{fin_text}"))
+            header = f"═══ 年度报告: {label} (财年 {year}) ═══" if _is_cn else \
+                     f"═══ Annual report: {label} (Fiscal Year {year}) ═══"
+            parts.append(types.Part(text=f"{header}\n\n{fin_text}"))
 
-        prompt = _build_batch_fcf_prompt(table_csv, batch_years, market=market)
+        if _is_cn:
+            prompt = _build_batch_fcf_prompt_cn(table_csv, batch_years)
+            _sys_prompt = FCF_SYSTEM_PROMPT_CN
+        else:
+            prompt = _build_batch_fcf_prompt(table_csv, batch_years, market=market)
+            _sys_prompt = FCF_SYSTEM_PROMPT
         prompt_info["batch_prompts"].append(prompt)
         parts.append(types.Part(text=prompt))
 
@@ -1647,7 +1887,7 @@ def fill_fcf_table_with_llm(
                 client, model_name,
                 contents=[types.Content(role="user", parts=parts)],
                 config=types.GenerateContentConfig(
-                    system_instruction=FCF_SYSTEM_PROMPT,
+                    system_instruction=_sys_prompt,
                     temperature=0.1,
                 ),
                 log_fn=log, enabled_models=_enabled,
@@ -1723,9 +1963,18 @@ def fill_fcf_table_with_llm(
                 progress_callback(None, processed, total_years + len(failed_years))
 
             log(f"🔄 重试 {year}...")
+            _is_cn_retry = (market or "").upper() == "CN"
+            if _is_cn_retry:
+                _retry_prompt = _build_batch_fcf_prompt_cn(table_csv, [year])
+                _retry_sys = FCF_SYSTEM_PROMPT_CN
+                _retry_header = f"年度报告节选 ({label}):"
+            else:
+                _retry_prompt = _build_batch_fcf_prompt(table_csv, [year], market=market)
+                _retry_sys = FCF_SYSTEM_PROMPT
+                _retry_header = f"Annual report excerpt ({label}):"
             parts = [
-                types.Part(text=f"Annual report excerpt ({label}):\n\n{fin_text}"),
-                types.Part(text=_build_batch_fcf_prompt(table_csv, [year], market=market)),
+                types.Part(text=f"{_retry_header}\n\n{fin_text}"),
+                types.Part(text=_retry_prompt),
             ]
 
             try:
@@ -1734,7 +1983,7 @@ def fill_fcf_table_with_llm(
                     client, model_name,
                     contents=[types.Content(role="user", parts=parts)],
                     config=types.GenerateContentConfig(
-                        system_instruction=FCF_SYSTEM_PROMPT,
+                        system_instruction=_retry_sys,
                         temperature=0.1,
                     ),
                     max_retries=2, log_fn=log, enabled_models=_enabled,
@@ -1817,11 +2066,20 @@ def fill_fcf_table_with_llm(
 
         log(f"\n🔄 NA 补填第 {na_round+1} 轮: 发现 {len(na_years)} 个年份仍有 N/A: {na_years}")
 
+        _is_cn_na = (market or "").upper() == "CN"
         for yr in na_years:
             fin_text, _tok, label = year_filing_text[yr]
+            if _is_cn_na:
+                _na_prompt = _build_batch_fcf_prompt_cn(filled.to_csv(index=False), [yr])
+                _na_sys = FCF_SYSTEM_PROMPT_CN
+                _na_header = f"═══ 年度报告: {label} (财年 {yr}) ═══"
+            else:
+                _na_prompt = _build_batch_fcf_prompt(filled.to_csv(index=False), [yr], market=market)
+                _na_sys = FCF_SYSTEM_PROMPT
+                _na_header = f"═══ Annual report: {label} (Fiscal Year {yr}) ═══"
             parts = [
-                types.Part(text=f"═══ Annual report: {label} (Fiscal Year {yr}) ═══\n\n{fin_text}"),
-                types.Part(text=_build_batch_fcf_prompt(filled.to_csv(index=False), [yr], market=market)),
+                types.Part(text=f"{_na_header}\n\n{fin_text}"),
+                types.Part(text=_na_prompt),
             ]
 
             try:
@@ -1831,7 +2089,7 @@ def fill_fcf_table_with_llm(
                     client, model_name,
                     contents=[types.Content(role="user", parts=parts)],
                     config=types.GenerateContentConfig(
-                        system_instruction=FCF_SYSTEM_PROMPT,
+                        system_instruction=_na_sys,
                         temperature=0.1,
                     ),
                     max_retries=2, log_fn=log, enabled_models=_enabled,
@@ -1975,6 +2233,7 @@ def fill_fcf_table_with_llm(
 
         # Step2: verify/correct ONE YEAR PER REQUEST.
         # Excerpt first, then fallback to FULL report for that same year.
+        _v_sys_prompt = FCF_SYSTEM_PROMPT_CN if (market or "").upper() == "CN" else FCF_SYSTEM_PROMPT
         any_correction = False
         step2_token_rows = []
         for yr in expanded_years:
@@ -2024,7 +2283,7 @@ def fill_fcf_table_with_llm(
                             types.Part(text=fix_prompt),
                         ])],
                         config=types.GenerateContentConfig(
-                            system_instruction=FCF_SYSTEM_PROMPT,
+                            system_instruction=_v_sys_prompt,
                             temperature=0.1,
                         ),
                         log_fn=log, enabled_models=_enabled,
@@ -2078,7 +2337,7 @@ def fill_fcf_table_with_llm(
                             types.Part(text=fix_prompt),
                         ])],
                         config=types.GenerateContentConfig(
-                            system_instruction=FCF_SYSTEM_PROMPT,
+                            system_instruction=_v_sys_prompt,
                             temperature=0.1,
                         ),
                         log_fn=log, enabled_models=_enabled,
