@@ -23,7 +23,9 @@ index.json schema:
                 "filing_date": "2024-11-01",
                 "primary_doc": "aapl-20240928.htm",
                 "downloaded": true,
-                "local_path": "10-K/2024-09-28_10-K_aapl-20240928.htm"
+                "local_path": "10-K/2024-09-28_10-K_aapl-20240928.htm",
+                "has_excerpt": true,
+                "excerpt_tokens": 12345
             },
             ...
         ]
@@ -48,8 +50,23 @@ class FilingStore:
     # ── Index I/O ────────────────────────────────────────────────────
     def _load_index(self) -> dict:
         if os.path.exists(self._index_path):
-            with open(self._index_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(self._index_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            # Migrate old entries that predate excerpt tracking
+            _repo_root = os.path.dirname(self.BASE_DIR)
+            for entry in data.get("filings", []):
+                if "has_excerpt" not in entry:
+                    entry["has_excerpt"] = False
+                    entry["excerpt_tokens"] = 0
+                    lp = entry.get("local_path", "")
+                    if lp:
+                        cache_p = os.path.join(
+                            _repo_root, "cache", "SEC_Filings", self.ticker,
+                            os.path.splitext(lp)[0] + "_financial.txt",
+                        )
+                        if os.path.exists(cache_p):
+                            entry["has_excerpt"] = True
+            return data
         return {
             "ticker": self.ticker,
             "cik": None,
@@ -59,8 +76,8 @@ class FilingStore:
 
     def save(self):
         self._index["updated"] = datetime.now().isoformat()
-        with open(self._index_path, "w", encoding="utf-8") as f:
-            json.dump(self._index, f, indent=2, ensure_ascii=False)
+        with open(self._index_path, "w", encoding="utf-8") as fh:
+            json.dump(self._index, fh, indent=2, ensure_ascii=False)
 
     @property
     def cik(self):
@@ -142,6 +159,15 @@ class FilingStore:
                 return not os.path.exists(os.path.join(self.store_dir, lp))
         return True
 
+    # ── Excerpt tracking ─────────────────────────────────────────────
+    def _excerpt_cache_path(self, local_path: str) -> str:
+        """Compute the expected excerpt cache file path for a given local_path."""
+        repo_root = os.path.dirname(self.BASE_DIR)
+        return os.path.join(
+            repo_root, "cache", "SEC_Filings", self.ticker,
+            os.path.splitext(local_path)[0] + "_financial.txt",
+        )
+
     def mark_excerpted(self, accession: str, tokens: int = 0):
         """Record that a filing's financial excerpt has been cached to disk."""
         for f in self.filings:
@@ -193,3 +219,18 @@ class FilingStore:
             "quarterly_total": len([f for f in self.filings if f["form"] in ("10-Q", "6-K")]),
             "quarterly_downloaded": self.count_downloaded(("10-Q", "6-K")),
         }
+
+
+def get_sec_filings_total_size() -> int:
+    """Return total disk usage of all files in SEC_Filings/, in bytes."""
+    base = FilingStore.BASE_DIR
+    if not os.path.exists(base):
+        return 0
+    total = 0
+    for root, _, files in os.walk(base):
+        for fname in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fname))
+            except OSError:
+                pass
+    return total

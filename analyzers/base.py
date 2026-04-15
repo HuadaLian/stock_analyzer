@@ -577,11 +577,16 @@ class MarketAnalyzer:
                 filing_store=filing_store,
             )
             progress_bar.progress(1.0, text=f"完成 | {_fmt_counter(prog)}")
-            # Delete raw filings whose excerpts are now cached
+            # Delete raw filings only when SEC_Filings/ total exceeds 20 GB
             if filing_store is not None:
-                n = filing_store.delete_raw_filings()
-                if n:
-                    _progress(msg=f"🗑 已删除 {n} 份原始年报文件（节选已缓存，可随时重新下载）")
+                from filing_store import get_sec_filings_total_size
+                _20GB = 20 * 1024 ** 3
+                if get_sec_filings_total_size() > _20GB:
+                    n = filing_store.delete_raw_filings()
+                    if n:
+                        _progress(
+                            msg=f"🗑 SEC_Filings 已超 20 GB，自动清理 {n} 份原始年报（节选已缓存，随时可重新下载）"
+                        )
             # Show prompt used
             with st.expander("📜 查看发送给 Gemini 的 Prompt", expanded=False):
                 st.markdown(f"**System Prompt:**\n```\n{prompt_info['system_prompt']}\n```")

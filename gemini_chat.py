@@ -1874,6 +1874,11 @@ def fill_fcf_table_with_llm(
     else:
         log("✅ 表格中没有 N/A 值需要填充，将直接进行验证。")
 
+    # LLM request budget: cap at max(4, 2×annual_filings) successful calls
+    max_successful_llm = max(4, 2 * len(annual_filings))
+    _llm_calls = 0
+    log(f"🔢 LLM请求上限: {max_successful_llm} 次（年报 {len(annual_filings)} 份）")
+
     # ── Extract financial sections for fill years + verification years ─
     years_to_extract = sorted(
         set(all_years_to_fill) | set(all_years_with_filings), reverse=True
@@ -2002,6 +2007,10 @@ def fill_fcf_table_with_llm(
 
     for batch_i, batch in enumerate(batches):
         batch_years = [y for y, _, _ in batch]
+        if _llm_calls >= max_successful_llm:
+            log(f"⛔ 已达到LLM请求上限 ({max_successful_llm})，跳过剩余批次")
+            failed_years.extend(batch_years)
+            break
         log(f"\n🤖 批次 {batch_i+1}/{total_batches}: 年份 {batch_years}")
 
         if progress_callback:
@@ -2040,6 +2049,7 @@ def fill_fcf_table_with_llm(
             processed += len(batch)
             continue
 
+        _llm_calls += 1
         log(f"📨 Gemini 批次 {batch_i+1} 回复:\n{_format_llm_output_for_log(reply, 1200)}")
 
         # Parse response — expect array or single object
@@ -2101,6 +2111,9 @@ def fill_fcf_table_with_llm(
                 continue
             fin_text, tokens, label = year_filing_text[year]
 
+            if _llm_calls >= max_successful_llm:
+                log(f"⛔ 已达到LLM请求上限 ({max_successful_llm})，停止重试")
+                break
             if progress_callback:
                 progress_callback(None, processed, total_years + len(failed_years))
 
@@ -2135,6 +2148,7 @@ def fill_fcf_table_with_llm(
                 processed += 1
                 continue
 
+            _llm_calls += 1
             log(f"📨 Gemini 重试 {year} 回复:\n{_format_llm_output_for_log(reply, 1000)}")
             data = _parse_llm_json(reply)
             if isinstance(data, list) and data:
@@ -2186,6 +2200,9 @@ def fill_fcf_table_with_llm(
     _na_key_cols = ["OCF", "CapEx", "FCF"]
 
     for na_round in range(_NA_RETRY_ROUNDS):
+        if _llm_calls >= max_successful_llm:
+            log(f"⛔ 已达到LLM请求上限 ({max_successful_llm})，跳过NA补填")
+            break
         # Find years that still have N/A in key columns and have a filing
         na_years = []
         for _, row in filled.iterrows():
@@ -2210,6 +2227,9 @@ def fill_fcf_table_with_llm(
 
         _is_cn_na = (market or "").upper() == "CN"
         for yr in na_years:
+            if _llm_calls >= max_successful_llm:
+                log(f"⛔ 已达到LLM请求上限 ({max_successful_llm})，停止NA补填")
+                break
             fin_text, _tok, label = year_filing_text[yr]
             if _is_cn_na:
                 _na_prompt = _build_batch_fcf_prompt_cn(filled.to_csv(index=False), [yr])
@@ -2240,6 +2260,7 @@ def fill_fcf_table_with_llm(
                 log(f"❌ {yr}: NA 补填失败: {e}")
                 continue
 
+            _llm_calls += 1
             log(f"📨 Gemini NA补填 {yr} 回复:\n{_format_llm_output_for_log(reply, 1000)}")
             data = _parse_llm_json(reply)
             if isinstance(data, list) and data:
@@ -2379,6 +2400,9 @@ def fill_fcf_table_with_llm(
         any_correction = False
         step2_token_rows = []
         for yr in expanded_years:
+            if _llm_calls >= max_successful_llm:
+                log(f"⛔ 已达到LLM请求上限 ({max_successful_llm})，停止验证")
+                break
             filing = _find_filing_for_year(yr, annual_filings)
             if not filing:
                 continue
@@ -2441,6 +2465,8 @@ def fill_fcf_table_with_llm(
                         log(f"📨 Gemini 验证 iter{v_iter} Step2 year{yr} excerpt 回复:\n{_format_llm_output_for_log(reply, 1000)}")
                 except Exception as e:
                     log(f"⚠️ 验证 iter{v_iter} year{yr} 节选失败: {e}")
+                else:
+                    _llm_calls += 1
 
             # 2) Fallback to full report for this same year
             need_full_fallback = True
@@ -2456,6 +2482,11 @@ def fill_fcf_table_with_llm(
                         need_full_fallback = False
                         break
 
+            if need_full_fallback:
+                if _llm_calls >= max_successful_llm:
+                    log(f"⛔ 已达到LLM请求上限 ({max_successful_llm})，跳过完整年报验证")
+                    corrections = []
+                    need_full_fallback = False
             if need_full_fallback:
                 try:
                     full_text = extract_text(filing["path"])
@@ -2496,6 +2527,8 @@ def fill_fcf_table_with_llm(
                 except Exception as e:
                     log(f"⚠️ 验证 iter{v_iter} year{yr} 完整年报失败: {e}")
                     corrections = []
+                else:
+                    _llm_calls += 1
 
             if isinstance(corrections, list) and corrections:
                 for item in corrections:
@@ -2577,6 +2610,7 @@ def fill_fcf_table_with_llm(
 
     log(f"\n🎉 完成! 共处理 {total_years} 个年份" +
         (f"，其中 {len(failed_years)} 个需要重试" if failed_years else ""))
+    log(f"📊 LLM请求统计: 共使用 {_llm_calls}/{max_successful_llm} 次成功请求")
     if progress_callback:
         progress_callback(None, total_years, total_years)
 

@@ -31,6 +31,21 @@ class USAnalyzer(MarketAnalyzer):
         try:
             mcap = data.get("market_cap")
             meta = {"market_cap": mcap, "market": "US"} if mcap else {"market": "US"}
+            try:
+                from data_provider import compute_dcf_lines
+                price = data.get("last_price")
+                fcf_ps = data.get("fcf_per_share_by_year", {})
+                if price and fcf_ps:
+                    dcf_df = compute_dcf_lines(fcf_ps)
+                    if not dcf_df.empty:
+                        dcf_14x = float(dcf_df["dcf_14x"].iloc[-1])
+                        dcf_34x = float(dcf_df["dcf_34x"].iloc[-1])
+                        if dcf_14x > 0:
+                            meta["last_price"] = price
+                            meta["dcf_14x"] = dcf_14x
+                            meta["dcf_34x"] = dcf_34x
+            except Exception:
+                pass
             mark_analyzed(ticker, metadata=meta)
         except Exception:
             mark_analyzed(ticker)
