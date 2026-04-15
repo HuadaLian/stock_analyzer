@@ -53,6 +53,21 @@ def remove_analyzed(ticker: str):
     _save_tracker(data)
 
 
+def patch_metadata(ticker: str, metadata: dict):
+    """Update specific metadata fields for an existing tracker entry.
+
+    Unlike mark_analyzed(), this does NOT change the timestamp or status —
+    it only merges the given fields into the existing entry. If the ticker
+    is not in the tracker, this is a no-op.
+    """
+    data = _load_tracker()
+    analyzed = data.get("analyzed", {})
+    tk = ticker.upper()
+    if tk in analyzed:
+        analyzed[tk].update(metadata)
+        _save_tracker(data)
+
+
 def get_next_unanalyzed(universe: dict, analyzed: dict) -> str | None:
     """Return the next ticker in the universe that hasn't been analyzed yet.
 

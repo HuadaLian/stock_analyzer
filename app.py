@@ -323,6 +323,23 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
             chart_data = load_chart(tk, market)
             if chart_data:
                 result = _dcf_metrics_from_data(chart_data)
+                # Write back to tracker so future sessions skip the pickle load
+                if not math.isnan(result[0]):
+                    try:
+                        from data_provider import compute_dcf_lines
+                        from analysis_tracker import patch_metadata
+                        p = chart_data.get("last_price")
+                        fcf_ps = chart_data.get("fcf_per_share_by_year", {})
+                        if p and fcf_ps:
+                            dcf_df = compute_dcf_lines(fcf_ps)
+                            if not dcf_df.empty:
+                                patch_metadata(tk, {
+                                    "last_price": float(p),
+                                    "dcf_14x": float(dcf_df["dcf_14x"].iloc[-1]),
+                                    "dcf_34x": float(dcf_df["dcf_34x"].iloc[-1]),
+                                })
+                    except Exception:
+                        pass
             else:
                 result = (float("nan"), float("nan"))
         except Exception:
