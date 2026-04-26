@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import gemini_chat; print\\('gemini_chat OK'\\); import analyzers.cn; print\\('cn.py OK'\\)\")",
+      "Bash(python -c \"import gemini_chat; print\\('gemini_chat OK'\\)\")",
+      "Bash(ls /c/Users/huada/stock_analyzer/saved_tables/*.txt)",
+      "Bash(/c/Users/huada/miniconda3/envs/stock_analyzer/python.exe -c \"import sys; sys.path.insert\\(0, '.'\\); import gemini_chat; print\\('OK'\\)\")",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); import gemini_chat; print\\('OK'\\)\")",
+      "Bash(where python:*)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('data_provider.py', encoding='utf-8'\\).read\\(\\)\\); print\\('data_provider OK'\\)\")",
+      "Bash(/c/Users/huada/miniconda3/envs/stock_analyzer/python.exe -c \"import ast; ast.parse\\(open\\('c:/Users/huada/stock_analyzer/data_provider.py', encoding='utf-8'\\).read\\(\\)\\); print\\('data_provider OK'\\)\")",
+      "Bash(/c/Users/huada/miniconda3/envs/stock_analyzer/python.exe -c \"import ast; ast.parse\\(open\\('c:/Users/huada/stock_analyzer/analyzers/base.py', encoding='utf-8'\\).read\\(\\)\\); print\\('base OK'\\)\")",
+      "Bash(/c/Users/huada/miniconda3/envs/stock_analyzer/python.exe -c \"import ast; ast.parse\\(open\\('c:/Users/huada/stock_analyzer/gemini_chat.py', encoding='utf-8'\\).read\\(\\)\\); print\\('gemini_chat OK'\\)\")",
+      "Bash(/c/Users/huada/miniconda3/Scripts/conda run *)",
+      "PowerShell(conda run -n stock_analyzer pip install duckdb --quiet 2>&1)",
+      "PowerShell(& \"C:\\\\Users\\\\huada\\\\anaconda3\\\\envs\\\\stock_analyzer\\\\python.exe\" -m pip install duckdb --quiet 2>&1)",
+      "Bash(/c/Users/huada/anaconda3/envs/stock_analyzer/python.exe verify_db.py)",
+      "Bash(/c/Users/huada/anaconda3/envs/stock_analyzer/python.exe -m pip install pytest --quiet)",
+      "WebSearch",
+      "WebFetch(domain:site.financialmodelingprep.com)",
+      "Bash(/c/Users/huada/anaconda3/envs/stock_analyzer/python.exe check_nvda.py)",
+      "Read(//c/Users/huada/.claude/projects/c--Users-huada-stock-analyzer/**)",
+      "Read(//c/Users/huada/.claude/**)",
+      "Bash(/c/Users/huada/anaconda3/envs/stock_analyzer/python.exe -m pytest tests/etl_fmp/ -v)",
+      "Bash(/c/Users/huada/anaconda3/envs/stock_analyzer/python.exe -c \"from db.schema import init_db; init_db\\(\\)\")",
+      "Bash(/c/Users/huada/anaconda3/envs/stock_analyzer/python.exe -c ' *)",
+      "Bash(/c/Users/huada/anaconda3/envs/stock_analyzer/python.exe etl_run.py --tickers NVDA)",
+      "Bash(/c/Users/huada/anaconda3/envs/stock_analyzer/python.exe -m pytest tests/etl_fmp -q)"
+    ]
+  }
+}

@@ -1,0 +1,1074 @@
+"""Dashboard D1: price chart with EMA and DCF overlays (US)."""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, date
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from google import genai
+from google.genai import types
+
+from db.repository import (
+    get_ohlcv,
+    get_fundamentals,
+    get_dcf_history,
+    get_fmp_dcf_history,
+    get_company,
+    get_dcf_metrics,
+    get_all_tickers,
+)
+from db.schema import get_conn
+from etl.loader import upsert_ohlcv_daily, upsert_ohlcv_ema, upsert_fmp_dcf_history
+from etl.sources.fmp_dcf import fetch_fmp_dcf_history
+from etl.sources.fmp import fetch_profile, fetch_ohlcv
+from data_provider import _fmp_analyst_data
+from futu_client import FutuClient
+
+
+_DCF_COLORS = {
+    "dcf_14x": "#3b82f6",
+    "dcf_24x": "#10b981",
+    "dcf_34x": "#f59e0b",
+}
+
+
+def _ensure_ema_columns(df_ohlcv: pd.DataFrame) -> pd.DataFrame:
+    """Ensure EMA columns exist for plotting without mutating DB."""
+    out = df_ohlcv.copy()
+    ema10_calc = out["adj_close"].ewm(span=10, adjust=False).mean()
+    ema250_calc = out["adj_close"].ewm(span=250, adjust=False).mean()
+
+    if "ema10" not in out.columns:
+        out["ema10"] = ema10_calc
+    else:
+        out["ema10"] = out["ema10"].fillna(ema10_calc)
+
+    if "ema250" not in out.columns:
+        out["ema250"] = ema250_calc
+    else:
+        out["ema250"] = out["ema250"].fillna(ema250_calc)
+
+    return out
+
+
+def _build_dcf_history_fallback(df_fund: pd.DataFrame,
+                                df_ohlcv: pd.DataFrame,
+                                ticker: str) -> pd.DataFrame:
+    """Build DCF history in-memory from fundamentals when dcf_history is empty."""
+    if df_fund.empty or "fcf_per_share" not in df_fund.columns:
+        return pd.DataFrame()
+
+    work = df_fund[["fiscal_year", "filing_date", "fcf_per_share"]].copy()
+    work["fcf_per_share"] = pd.to_numeric(work["fcf_per_share"], errors="coerce")
+    work = work.dropna(subset=["fcf_per_share"]).sort_values("fiscal_year")
+    if work.empty:
+        return pd.DataFrame()
+
+    trade_dates = pd.to_datetime(df_ohlcv["date"]).dt.normalize().sort_values().reset_index(drop=True)
+
+    def _snap_to_trade_day(filing_date):
+        if pd.isna(filing_date):
+            return pd.NaT
+        ts = pd.Timestamp(filing_date).normalize()
+        idx = trade_dates.searchsorted(ts, side="right") - 1
+        if idx < 0:
+            return ts
+        return trade_dates.iloc[idx]
+
+    values = list(work["fcf_per_share"].astype(float))
+    years = list(work["fiscal_year"].astype(int))
+    filings = list(work["filing_date"])
+
+    rows = []
+    for i, year in enumerate(years):
+        window = values[max(0, i - 2): i + 1]
+        avg = float(pd.Series(window).mean())
+        if avg <= 0:
+            window5 = values[max(0, i - 4): i + 1]
+            avg5 = float(pd.Series(window5).mean())
+            if avg5 > avg:
+                avg = avg5
+
+        rows.append({
+            "ticker": ticker,
+            "fiscal_year": year,
+            "anchor_date": _snap_to_trade_day(filings[i]),
+            "fcf_ps_avg3yr": avg,
+            "dcf_14x": 14 * avg,
+            "dcf_24x": 24 * avg,
+            "dcf_34x": 34 * avg,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _build_chart(df_ohlcv: pd.DataFrame,
+                 df_dcf_hist: pd.DataFrame,
+                 df_fmp_dcf: pd.DataFrame,
+                 ticker: str) -> go.Figure:
+    latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Candlestick(
+        x=df_ohlcv["date"],
+        open=df_ohlcv["open"],
+        high=df_ohlcv["high"],
+        low=df_ohlcv["low"],
+        close=df_ohlcv["close"],
+        name="K线",
+        increasing_line_color="#ef5350",
+        increasing_fillcolor="#ef5350",
+        decreasing_line_color="#26a69a",
+        decreasing_fillcolor="#26a69a",
+    ))
+
+    fig.add_trace(go.Scattergl(
+        x=df_ohlcv["date"],
+        y=df_ohlcv["ema10"],
+        name="EMA 10",
+        line=dict(color="#f94144", width=1),
+        mode="lines",
+        hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scattergl(
+        x=df_ohlcv["date"],
+        y=df_ohlcv["ema250"],
+        name="EMA 250",
+        line=dict(color="#7209b7", width=2),
+        mode="lines",
+        hoverinfo="skip",
+    ))
+
+    if not df_dcf_hist.empty:
+        dcf = df_dcf_hist.sort_values("fiscal_year").copy()
+        dcf["anchor_date"] = pd.to_datetime(dcf["anchor_date"])
+
+        for col, name in [
+            ("dcf_14x", "DCF 14x"),
+            ("dcf_24x", "DCF 24x"),
+            ("dcf_34x", "DCF 34x"),
+        ]:
+            vals = list(dcf[col])
+            xs = list(dcf["anchor_date"])
+            if vals:
+                xs.append(pd.Timestamp(datetime.now().date()))
+                vals.append(vals[-1])
+            fig.add_trace(go.Scatter(
+                x=xs,
+                y=vals,
+                name=name,
+                line=dict(color=_DCF_COLORS[col], width=2.5, dash="dash"),
+                mode="lines+markers",
+                marker=dict(size=9, symbol="diamond", line=dict(width=1, color="white")),
+                connectgaps=True,
+            ))
+
+    if not df_fmp_dcf.empty:
+        fmp = df_fmp_dcf.sort_values("date").copy()
+        fmp["date"] = pd.to_datetime(fmp["date"])
+        xs = list(fmp["date"])
+        ys = list(fmp["dcf_value"])
+        if ys:
+            xs.append(pd.Timestamp(datetime.now().date()))
+            ys.append(ys[-1])
+        fig.add_trace(go.Scatter(
+            x=xs,
+            y=ys,
+            name="FMP DCF",
+            line=dict(color="#e879f9", width=2, dash="dot"),
+            mode="lines+markers",
+            marker=dict(size=7, symbol="circle", color="#e879f9"),
+            connectgaps=True,
+        ))
+
+        # Force a clearly visible reference line from latest DB value.
+        latest_fmp = float(pd.to_numeric(fmp["dcf_value"], errors="coerce").dropna().iloc[-1])
+        ohlcv_dates = pd.to_datetime(df_ohlcv["date"])
+        x0 = ohlcv_dates.min()
+        x1 = max(ohlcv_dates.max(), pd.Timestamp(datetime.now().date()))
+        fig.add_trace(go.Scatter(
+            x=[x0, x1],
+            y=[latest_fmp, latest_fmp],
+            name="FMP DCF(最新)",
+            line=dict(color="#ff4dd2", width=2.6, dash="dot"),
+            mode="lines",
+            hovertemplate="FMP DCF(最新): $%{y:,.2f}<extra></extra>",
+        ))
+
+    annotations = []
+    if latest_price is not None:
+        annotations.append(dict(
+            x=df_ohlcv["date"].iloc[-1],
+            y=latest_price,
+            text=f"  ${latest_price:,.2f}",
+            showarrow=False,
+            font=dict(color="#00d4ff", size=14, family="monospace"),
+            xanchor="left",
+            yanchor="middle",
+            bgcolor="rgba(10,14,23,0.8)",
+            bordercolor="#00d4ff",
+            borderwidth=1,
+            borderpad=4,
+        ))
+
+    # Build y-range from all plotted series so DCF/FMP DCF lines are never clipped.
+    y_candidates = []
+    y_candidates.extend(pd.to_numeric(df_ohlcv["high"], errors="coerce").dropna().tolist())
+    y_candidates.extend(pd.to_numeric(df_ohlcv["low"], errors="coerce").dropna().tolist())
+    y_candidates.extend(pd.to_numeric(df_ohlcv["ema10"], errors="coerce").dropna().tolist())
+    y_candidates.extend(pd.to_numeric(df_ohlcv["ema250"], errors="coerce").dropna().tolist())
+
+    if not df_dcf_hist.empty:
+        for col in ["dcf_14x", "dcf_24x", "dcf_34x"]:
+            if col in df_dcf_hist.columns:
+                y_candidates.extend(pd.to_numeric(df_dcf_hist[col], errors="coerce").dropna().tolist())
+
+    if not df_fmp_dcf.empty and "dcf_value" in df_fmp_dcf.columns:
+        y_candidates.extend(pd.to_numeric(df_fmp_dcf["dcf_value"], errors="coerce").dropna().tolist())
+
+    if y_candidates:
+        y_max = max(y_candidates)
+        y_min = min(y_candidates)
+        span = max(y_max - y_min, 1e-6)
+        y_top = y_max + span * 0.12
+        y_bottom = max(0.0, y_min - span * 0.12)
+    else:
+        price_max = float(df_ohlcv["high"].max())
+        price_min = float(df_ohlcv["low"].min())
+        y_top = price_max * 1.12
+        y_bottom = max(0.0, price_min * 0.88)
+
+    date_min = pd.to_datetime(df_ohlcv["date"]).min()
+    date_max = pd.to_datetime(df_ohlcv["date"]).max()
+    date_span = date_max - date_min
+    x_right = date_max + date_span * 0.2
+
+    fig.update_layout(
+        title=dict(text=f"{ticker.upper()} 日K线", font=dict(color="#e0e7ff", size=20)),
+        yaxis_title="价格 (USD)",
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark",
+        paper_bgcolor="#0a0e17",
+        plot_bgcolor="#0f1629",
+        height=760,
+        dragmode="pan",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            font=dict(color="#94a3b8", size=12),
+        ),
+        margin=dict(l=60, r=100, t=60, b=40),
+        xaxis=dict(
+            gridcolor="#1e3a5f",
+            zerolinecolor="#1e3a5f",
+            range=[date_min, x_right],
+            tickfont=dict(size=13, color="#cbd5e1"),
+            title=dict(font=dict(size=14, color="#cbd5e1")),
+        ),
+        yaxis=dict(
+            gridcolor="#1e3a5f",
+            zerolinecolor="#1e3a5f",
+            range=[y_bottom, y_top],
+            fixedrange=False,
+            tickfont=dict(size=13, color="#cbd5e1"),
+            title=dict(text="价格 (USD)", font=dict(size=15, color="#cbd5e1")),
+        ),
+        annotations=annotations,
+    )
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+
+    return fig
+
+
+def _load_gemini_api_key() -> str:
+    """Load GEMINI_API_KEY from env/.env for note markdown formatting."""
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+        env_path = os.path.abspath(env_path)
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                txt = line.strip()
+                if txt.startswith("GEMINI_API_KEY="):
+                    return txt.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _get_note_row(ticker: str) -> dict | None:
+    """Fetch latest note row for ticker from notes table."""
+    with get_conn(readonly=True) as conn:
+        cur = conn.execute(
+            """
+            SELECT id, ticker, raw_text, markdown, created_at, updated_at
+            FROM notes
+            WHERE ticker = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            [ticker],
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+
+def _generate_markdown_from_raw_note(raw_text: str) -> str:
+    """Send raw note to LLM and require strict JSON response containing markdown source."""
+    api_key = _load_gemini_api_key()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY 未配置")
+
+    prompt = (
+        "你是一个专业投研笔记整理助手。\\n"
+        "任务：把下面的原始笔记整理成结构清晰的 Markdown。\\n"
+        "要求：\\n"
+        "1) 保留原始信息，不编造事实。\\n"
+        "2) 按 Markdown 语法组织为标题、要点、结论、待跟踪。\\n"
+        "3) 只输出 JSON，不要输出任何解释文字。\\n"
+        "4) JSON 格式必须是：{\"markdown\": \"...\"}\\n\\n"
+        "原始笔记如下：\\n"
+        f"{raw_text}"
+    )
+
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash-lite",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            response_mime_type="application/json",
+        ),
+    )
+
+    text = (getattr(resp, "text", "") or "").strip()
+    if not text:
+        raise RuntimeError("LLM 未返回内容")
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"LLM 返回非JSON: {str(e)[:80]}") from e
+
+    markdown = str(payload.get("markdown") or "").strip()
+    if not markdown:
+        raise RuntimeError("LLM 返回JSON缺少 markdown 字段")
+    return markdown
+
+
+def _append_note_and_save(ticker: str, new_note_text: str) -> tuple[bool, str]:
+    """Append raw note (not overwrite), generate markdown via LLM, save both into DB."""
+    content = (new_note_text or "").strip()
+    if not content:
+        return False, "请输入笔记内容"
+
+    row = _get_note_row(ticker)
+    note_id = row["id"] if row else f"d1_note_{ticker.upper()}"
+    raw_existing = (row.get("raw_text") or "") if row else ""
+    md_existing = (row.get("markdown") or "") if row else ""
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    append_block = f"[{ts}]\\n{content}"
+    merged_raw = f"{raw_existing}\\n\\n{append_block}".strip() if raw_existing else append_block
+
+    # Always try LLM on each save; keep previous markdown if this call fails.
+    try:
+        md_text = _generate_markdown_from_raw_note(merged_raw)
+    except Exception as e:
+        md_text = md_existing
+        llm_err = str(e)[:80]
+    else:
+        llm_err = ""
+
+    with get_conn() as conn:
+        exists = conn.execute("SELECT 1 FROM notes WHERE id = ? LIMIT 1", [note_id]).fetchone()
+        if exists:
+            conn.execute(
+                """
+                UPDATE notes
+                SET ticker = ?, raw_text = ?, markdown = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                [ticker, merged_raw, md_text, note_id],
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO notes (id, ticker, raw_text, markdown, created_at, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                [note_id, ticker, merged_raw, md_text],
+            )
+
+    if llm_err:
+        return True, f"已追加保存原始笔记；Markdown 生成失败: {llm_err}"
+    return True, "已追加保存笔记，并更新 Markdown 笔记"
+
+
+def _render_notes_panel_d1(ticker: str) -> None:
+    """Render notes area below chart, same width as chart column."""
+    show_md_key = f"d1_note_show_md_{ticker}"
+    if show_md_key not in st.session_state:
+        st.session_state[show_md_key] = False
+
+    with st.form(key=f"d1_note_form_{ticker}", clear_on_submit=True):
+        note_input = st.text_area(
+            "追加笔记",
+            key=f"d1_note_input_{ticker}",
+            height=78,
+            placeholder="输入本次新增笔记，保存后会追加到原始笔记并生成 Markdown",
+            label_visibility="collapsed",
+        )
+        do_save_note = st.form_submit_button("保存笔记", type="primary")
+
+    if do_save_note:
+        with st.spinner("保存中：追加原始笔记并请求 LLM 生成 Markdown..."):
+            ok, msg = _append_note_and_save(ticker, note_input)
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
+
+    with st.expander("投研笔记（点击展开）", expanded=False):
+        c_show, c_hide = st.columns([1, 1], gap="small")
+        with c_show:
+            if st.button("显示已保存笔记", key=f"d1_note_show_btn_{ticker}", width="stretch"):
+                st.session_state[show_md_key] = True
+        with c_hide:
+            if st.button("收起内容", key=f"d1_note_hide_btn_{ticker}", width="stretch"):
+                st.session_state[show_md_key] = False
+
+        if st.session_state.get(show_md_key, False):
+            row = _get_note_row(ticker)
+            existing_md = (row.get("markdown") or "") if row else ""
+            if existing_md:
+                st.markdown(existing_md)
+            else:
+                st.caption("当前没有已保存的 Markdown 笔记")
+        else:
+            st.caption("点击“显示已保存笔记”后再渲染")
+
+
+def _refresh_latest_fmp_data(ticker: str) -> tuple[bool, str]:
+    """
+    Lightweight refresh: fetch latest price and FMP DCF, write to DB.
+    
+    Returns: (success: bool, message: str)
+    """
+    try:
+        ticker_upper = ticker.upper()
+        
+        # Fetch profile for shares_out
+        profile = fetch_profile(ticker_upper)
+        if not profile:
+            return False, "无法获取公司信息"
+        shares_out = profile.get("shares_out")
+        
+        # Fetch latest OHLCV only (date_from = today - 1 day to catch latest close)
+        from_date = str(date.today())
+        ohlcv_rows = fetch_ohlcv(ticker_upper, shares_out_raw=shares_out, date_from=from_date)
+        
+        if not ohlcv_rows:
+            return False, "FMP 未返回最新价格数据"
+        
+        # Write OHLCV
+        conn = get_conn()
+        upsert_ohlcv_daily(conn, ohlcv_rows)
+        
+        # Compute and upsert EMA for new row
+        df_new = pd.DataFrame(ohlcv_rows)
+        if not df_new.empty:
+            # Get all historical data for EMA calculation
+            df_hist = get_ohlcv(ticker_upper)
+            if not df_hist.empty:
+                # Combine historical + new
+                df_combined = pd.concat([df_hist, df_new], ignore_index=True)
+                df_combined = df_combined.sort_values("date").reset_index(drop=True)
+                
+                # Calculate EMA
+                df_combined["ema10"] = df_combined["adj_close"].ewm(span=10, adjust=False).mean()
+                df_combined["ema250"] = df_combined["adj_close"].ewm(span=250, adjust=False).mean()
+                
+                # Upsert last row's EMA
+                last_row = df_combined.iloc[-1]
+                upsert_ohlcv_ema(conn, [{
+                    "ticker": ticker_upper,
+                    "date": last_row["date"],
+                    "ema10": last_row["ema10"],
+                    "ema250": last_row["ema250"],
+                }])
+        
+        # Fetch latest FMP DCF
+        from etl.sources.fmp import load_api_key
+        api_key = load_api_key()
+        if api_key:
+            try:
+                dcf_rows = fetch_fmp_dcf_history(ticker_upper, api_key)
+                if dcf_rows:
+                    upsert_fmp_dcf_history(conn, dcf_rows)
+                    msg = f"✅ 更新成功：{len(ohlcv_rows)} 行OHLCV，{len(dcf_rows)} 行FMP DCF"
+                else:
+                    msg = f"✅ 更新成功：{len(ohlcv_rows)} 行OHLCV（FMP DCF无新数据）"
+            except Exception as e:
+                msg = f"✅ 更新成功：{len(ohlcv_rows)} 行OHLCV（FMP DCF获取失败: {str(e)[:30]}）"
+        else:
+            msg = f"✅ 更新成功：{len(ohlcv_rows)} 行OHLCV（API密钥未配置）"
+        
+        conn.close()
+        return True, msg
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"{str(e)[:100]}"
+        return False, f"❌ 更新失败：{error_msg}"
+
+
+@st.cache_data(ttl=3600)
+def _fetch_analyst_data_cached(ticker: str) -> dict:
+    """Fetch and cache analyst data for 1 hour."""
+    return _fmp_analyst_data(ticker)
+
+
+def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
+    """Render analyst panel using the old-version UI design."""
+    try:
+        analyst_data = _fetch_analyst_data_cached(ticker)
+        current_price = latest_price
+        currency_sym = "$"
+
+        if not analyst_data:
+            return
+
+        pt = analyst_data.get("price_target") or {}
+        pts = analyst_data.get("price_target_summary") or {}
+        grades = analyst_data.get("grades") or []
+        gc = analyst_data.get("grades_consensus") or {}
+        status = analyst_data.get("fmp_analyst_status", "")
+
+        has_data = bool(pt or pts or grades or gc)
+
+        if not has_data:
+            st.caption(f"⚠️ {status}" if status else "暂无分析师数据")
+            return
+
+        if pt or pts:
+            consensus = (pt or {}).get("targetConsensus")
+            high = (pt or {}).get("targetHigh")
+            low = (pt or {}).get("targetLow")
+            median = (pt or {}).get("targetMedian")
+
+            upside = ((consensus - current_price) / current_price * 100) if (consensus and current_price) else None
+            up_sign = ("+" if upside >= 0 else "") if upside is not None else ""
+            up_clr = "#22c55e" if (upside is not None and upside >= 0) else "#ef4444"
+            up_badge = (
+                f'<span style="display:inline-block;background:{up_clr}22;color:{up_clr};'
+                f'border:1px solid {up_clr}55;border-radius:5px;padding:1px 7px;'
+                f'font-size:.75rem;font-weight:700;vertical-align:middle;margin-left:6px;">'
+                f'{up_sign}{upside:.1f}%</span>'
+            ) if upside is not None else ""
+
+            headline_html = ""
+            if consensus:
+                headline_html = (
+                    f'<div style="display:flex;align-items:baseline;gap:6px;margin-bottom:6px;">'
+                    f'<span style="color:#94a3b8;font-size:.72rem;white-space:nowrap;">目标价</span>'
+                    f'<span style="color:#e0e7ff;font-size:1.45rem;font-weight:800;'
+                    f'letter-spacing:-.5px;font-family:\'Cascadia Mono\',monospace;">'
+                    f'{currency_sym}{consensus:,.2f}</span>'
+                    f'{up_badge}'
+                    f'</div>'
+                )
+
+            range_bar_html = ""
+            if high and low and high > low:
+                def _pct(v):
+                    return max(0.0, min(100.0, (v - low) / (high - low) * 100))
+
+                cur_pct = _pct(current_price) if current_price else None
+                con_pct = _pct(consensus) if consensus else None
+                med_pct = _pct(median) if median else None
+
+                markers_html = ""
+                if cur_pct is not None:
+                    markers_html += (
+                        f'<div style="position:absolute;left:{cur_pct:.1f}%;'
+                        f'transform:translateX(-50%);top:-3px;">'
+                        f'<div style="width:2px;height:14px;background:#00d4ff;'
+                        f'border-radius:1px;box-shadow:0 0 5px #00d4ff88;"></div></div>'
+                        f'<div style="position:absolute;left:{cur_pct:.1f}%;'
+                        f'transform:translateX(-50%);top:13px;'
+                        f'color:#00d4ff;font-size:.62rem;white-space:nowrap;">现价</div>'
+                    )
+                if con_pct is not None:
+                    markers_html += (
+                        f'<div style="position:absolute;left:{con_pct:.1f}%;'
+                        f'transform:translateX(-50%);top:-3px;">'
+                        f'<div style="width:2px;height:14px;background:{up_clr};'
+                        f'border-radius:1px;box-shadow:0 0 5px {up_clr}88;"></div></div>'
+                        f'<div style="position:absolute;left:{con_pct:.1f}%;'
+                        f'transform:translateX(-50%);top:13px;'
+                        f'color:{up_clr};font-size:.62rem;white-space:nowrap;">共识</div>'
+                    )
+                if med_pct is not None:
+                    markers_html += (
+                        f'<div style="position:absolute;left:{med_pct:.1f}%;'
+                        f'transform:translateX(-50%);top:-1px;">'
+                        f'<div style="width:6px;height:6px;background:#f59e0b;'
+                        f'border-radius:50%;box-shadow:0 0 4px #f59e0b88;"></div></div>'
+                    )
+
+                fill_html = (
+                    f'<div style="position:absolute;left:0;width:{cur_pct:.1f}%;'
+                    f'height:100%;background:rgba(148,163,184,.2);border-radius:4px 0 0 4px;">'
+                    f'</div>'
+                ) if cur_pct is not None else ""
+                if cur_pct is not None and con_pct is not None:
+                    l = min(cur_pct, con_pct)
+                    w = abs(con_pct - cur_pct)
+                    fill_html += (
+                        f'<div style="position:absolute;left:{l:.1f}%;width:{w:.1f}%;'
+                        f'height:100%;background:{up_clr}44;border-radius:2px;"></div>'
+                    )
+
+                range_bar_html = (
+                    f'<div style="margin:14px 4px 26px;">'
+                    f'<div style="position:relative;height:8px;background:#1e3a5f;'
+                    f'border-radius:4px;overflow:visible;">'
+                    f'{fill_html}{markers_html}'
+                    f'</div>'
+                    f'<div style="display:flex;justify-content:space-between;margin-top:4px;">'
+                    f'<span style="color:#64748b;font-size:.65rem;">{currency_sym}{low:,.0f}</span>'
+                    f'<span style="color:#64748b;font-size:.65rem;font-style:italic;">目标价区间</span>'
+                    f'<span style="color:#64748b;font-size:.65rem;">{currency_sym}{high:,.0f}</span>'
+                    f'</div></div>'
+                )
+
+            hml_cells = ""
+            for v, lbl, clr in [(high, "最高", "#22c55e66"), (median, "中位", "#f59e0b66"), (low, "最低", "#ef444466")]:
+                if v:
+                    hml_cells += (
+                        f'<div style="text-align:center;flex:1;">'
+                        f'<div style="color:#64748b;font-size:.68rem;margin-bottom:2px;">{lbl}</div>'
+                        f'<div style="color:#e0e7ff;font-size:.82rem;font-weight:700;'
+                        f'border-bottom:2px solid {clr};padding-bottom:2px;">'
+                        f'{currency_sym}{v:,.2f}</div></div>'
+                    )
+            hml_html = (
+                f'<div style="display:flex;justify-content:space-evenly;'
+                f'background:#0a0e17;border-radius:7px;padding:8px 6px;margin-bottom:10px;">'
+                f'{hml_cells}</div>'
+            ) if hml_cells else ""
+
+            hist_html = ""
+            if pts:
+                lm_n = pts.get("lastMonthCount", 0)
+                lm_avg = pts.get("lastMonthAvgPriceTarget")
+                lq_n = pts.get("lastQuarterCount", 0)
+                lq_avg = pts.get("lastQuarterAvgPriceTarget")
+                ly_n = pts.get("lastYearCount", 0)
+                ly_avg = pts.get("lastYearAvgPriceTarget")
+
+                hist_rows = [(lm_avg, "近1月", lm_n), (lq_avg, "近1季", lq_n), (ly_avg, "近1年", ly_n)]
+                hist_cells = ""
+                for avg, label, n in hist_rows:
+                    if avg:
+                        delta = ((avg - current_price) / current_price * 100) if current_price else None
+                        d_html = ""
+                        if delta is not None:
+                            d_clr = "#22c55e" if delta >= 0 else "#ef4444"
+                            d_sign = "+" if delta >= 0 else ""
+                            d_html = f'<div style="color:{d_clr};font-size:.63rem;">{d_sign}{delta:.1f}%</div>'
+                        hist_cells += (
+                            f'<div style="text-align:center;flex:1;">'
+                            f'<div style="color:#475569;font-size:.66rem;">{label} <span style="color:#334155">({n}家)</span></div>'
+                            f'<div style="color:#94a3b8;font-size:.78rem;font-weight:600;">{currency_sym}{avg:,.2f}</div>'
+                            f'{d_html}'
+                            f'</div>'
+                        )
+                if hist_cells:
+                    hist_html = (
+                        f'<div style="display:flex;justify-content:space-evenly;'
+                        f'border-top:1px solid #1e3a5f;padding-top:8px;margin-top:2px;">'
+                        f'{hist_cells}</div>'
+                    )
+
+            st.markdown(
+                f'<div style="background:linear-gradient(145deg,#0f1d35,#111827);'
+                f'border:1px solid #1e3a5f;border-radius:12px;padding:14px 16px 10px;'
+                f'margin-bottom:10px;box-shadow:0 4px 20px rgba(0,0,0,.4),'
+                f'inset 0 1px 0 rgba(255,255,255,.04);">'
+                f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">'
+                f'<span style="display:inline-block;width:3px;height:14px;'
+                f'background:linear-gradient(180deg,#00d4ff,#3b82f6);border-radius:2px;"></span>'
+                f'<span style="color:#94a3b8;font-size:.72rem;font-weight:600;'
+                f'letter-spacing:.05em;">分析师共识</span>'
+                f'</div>'
+                f'{headline_html}'
+                f'{range_bar_html}'
+                f'{hml_html}'
+                f'{hist_html}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        buys = sells = holds = total = 0
+
+        if gc:
+            strong_buy = int(gc.get("strongBuy") or 0)
+            buy = int(gc.get("buy") or 0)
+            hold = int(gc.get("hold") or 0)
+            sell = int(gc.get("sell") or 0)
+            strong_sell = int(gc.get("strongSell") or 0)
+            buys = strong_buy + buy
+            holds = hold
+            sells = sell + strong_sell
+            total = buys + holds + sells
+            period_label = "综合评级共识"
+        elif grades:
+            from datetime import datetime as _dt, timedelta as _td
+
+            BUY_SET = {
+                "Strong Buy", "Buy", "Outperform", "Overweight",
+                "Add", "Accumulate", "Positive", "Market Outperform",
+            }
+            SELL_SET = {
+                "Sell", "Strong Sell", "Underperform", "Underweight",
+                "Reduce", "Negative",
+            }
+            cutoff = (_dt.now() - _td(days=90)).strftime("%Y-%m-%d")
+            recent = [g for g in grades if (g.get("date") or "") >= cutoff] or grades[:15]
+            buys = sum(1 for g in recent if (g.get("newGrade") or "") in BUY_SET)
+            sells = sum(1 for g in recent if (g.get("newGrade") or "") in SELL_SET)
+            holds = len(recent) - buys - sells
+            total = buys + holds + sells
+            period_label = "近90日评级"
+
+        if total > 0:
+            b_pct = buys / total * 100
+            h_pct = holds / total * 100
+            s_pct = sells / total * 100
+            header_html = ""
+            if not gc:
+                header_html = (
+                    f'<div style="margin:6px 0 4px;">'
+                    f'<span style="color:#94a3b8;font-size:.74rem;">'
+                    f'{period_label}（买入 {buys} / 持有 {holds} / 卖出 {sells}）'
+                    f'</span></div>'
+                )
+            mix_bar_html = (
+                header_html
+                + f'<div style="display:flex;height:9px;border-radius:5px;'
+                f'overflow:hidden;margin-bottom:5px;">'
+                f'<div style="width:{b_pct:.0f}%;background:#22c55e;"></div>'
+                f'<div style="width:{h_pct:.0f}%;background:#f59e0b;"></div>'
+                f'<div style="width:{s_pct:.0f}%;background:#ef4444;"></div>'
+                f'</div>'
+                f'<div style="display:flex;justify-content:space-between;font-size:.74rem;margin-bottom:6px;">'
+                f'<span style="color:#22c55e;">买入 {b_pct:.0f}%</span>'
+                f'<span style="color:#f59e0b;">持有 {h_pct:.0f}%</span>'
+                f'<span style="color:#ef4444;">卖出 {s_pct:.0f}%</span>'
+                f'</div>'
+            )
+            st.markdown(
+                mix_bar_html,
+                unsafe_allow_html=True,
+            )
+            if gc:
+                consensus_label = gc.get("consensus") or gc.get("rating") or ""
+                if consensus_label:
+                    cl_color = "#22c55e" if "buy" in consensus_label.lower() else (
+                        "#ef4444" if "sell" in consensus_label.lower() else "#f59e0b"
+                    )
+                    st.markdown(
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                        f'gap:8px;margin:0 0 8px;">'
+                        f'<span style="color:#94a3b8;font-size:.74rem;">'
+                        f'{period_label}（买入 {buys} / 持有 {holds} / 卖出 {sells}）</span>'
+                        f'<span style="background:#1a2035;border:1px solid #1e3a5f;'
+                        f'border-radius:6px;padding:2px 10px;color:{cl_color};'
+                        f'font-size:.8rem;font-weight:700;white-space:nowrap;">'
+                        f'共识: {consensus_label}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
+        if grades:
+            BUY_SET_COLORS = {
+                "Strong Buy", "Buy", "Outperform", "Overweight",
+                "Add", "Accumulate", "Positive", "Market Outperform",
+            }
+            SELL_SET_COLORS = {
+                "Sell", "Strong Sell", "Underperform", "Underweight",
+                "Reduce", "Negative",
+            }
+
+            def _grade_color(g):
+                if g in BUY_SET_COLORS:
+                    return "#22c55e"
+                if g in SELL_SET_COLORS:
+                    return "#ef4444"
+                return "#94a3b8"
+
+            st.markdown('<div style="color:#94a3b8;font-size:.74rem;margin:2px 0 4px;">最近评级动作</div>', unsafe_allow_html=True)
+            action_rows = []
+            for g in grades:
+                dt = (g.get("date") or "")[:10]
+                co = g.get("gradingCompany") or "—"
+                new_g = g.get("newGrade") or "—"
+                prev_g = g.get("previousGrade") or "—"
+                action = (g.get("action") or "").lower()
+                action_cn = {
+                    "upgrade": "上调",
+                    "downgrade": "下调",
+                    "init": "首次",
+                    "reiterated": "重申",
+                    "maintained": "维持",
+                }.get(action, action or "—")
+                action_rows.append(
+                    {
+                        "日期": dt,
+                        "机构": co,
+                        "动作": action_cn,
+                        "新评级": new_g,
+                        "前评级": prev_g,
+                    }
+                )
+            if action_rows:
+                action_df = pd.DataFrame(action_rows)
+                st.dataframe(action_df, width="stretch", height=252, hide_index=True)
+
+    except Exception as e:
+        st.warning(f"分析师数据加载失败: {str(e)[:50]}")
+
+
+def _render_price_alert_panel_d1(ticker: str, dcf_metrics: dict | None) -> None:
+    """Render compact price alert panel."""
+    try:
+        # Try to connect to Futu OpenD
+        try:
+            with FutuClient() as client:
+                futu_connected = True
+        except Exception:
+            futu_connected = False
+        
+        if not futu_connected:
+            st.warning("需要启动 Futu OpenD (127.0.0.1:11111) 来设置价格提醒")
+            return
+
+        dcf_14x = dcf_24x = dcf_34x = None
+        if dcf_metrics:
+            dcf_14x = dcf_metrics.get("dcf_14x")
+            dcf_24x = dcf_metrics.get("dcf_24x")
+            dcf_34x = dcf_metrics.get("dcf_34x")
+
+        left_quick, right_custom = st.columns([0.9, 2.1], gap="small")
+        with left_quick:
+            if dcf_14x:
+                if st.button(f"14x  ${dcf_14x:.1f}", key=f"alert_dcf14_{ticker}", width="stretch"):
+                    with FutuClient() as client:
+                        code = FutuClient.build_code(ticker, "US")
+                        success, msg = client.set_price_alert(code, dcf_14x, note="DCF 14x target")
+                        if success:
+                            st.success(f"14x 提醒已设置: ${dcf_14x:.2f}")
+                        else:
+                            st.error(f"设置失败: {msg}")
+            if dcf_24x:
+                if st.button(f"24x  ${dcf_24x:.1f}", key=f"alert_dcf24_{ticker}", width="stretch"):
+                    with FutuClient() as client:
+                        code = FutuClient.build_code(ticker, "US")
+                        success, msg = client.set_price_alert(code, dcf_24x, note="DCF 24x target")
+                        if success:
+                            st.success(f"24x 提醒已设置: ${dcf_24x:.2f}")
+                        else:
+                            st.error(f"设置失败: {msg}")
+            if dcf_34x:
+                if st.button(f"34x  ${dcf_34x:.1f}", key=f"alert_dcf34_{ticker}", width="stretch"):
+                    with FutuClient() as client:
+                        code = FutuClient.build_code(ticker, "US")
+                        success, msg = client.set_price_alert(code, dcf_34x, note="DCF 34x target")
+                        if success:
+                            st.success(f"34x 提醒已设置: ${dcf_34x:.2f}")
+                        else:
+                            st.error(f"设置失败: {msg}")
+
+        with right_custom:
+            c_price, c_type, c_btn = st.columns([1.15, 1.0, 0.75], gap="small")
+            with c_price:
+                custom_price = st.number_input(
+                    "目标价格",
+                    value=0.0,
+                    step=0.01,
+                    key=f"price_{ticker}",
+                    label_visibility="collapsed",
+                    placeholder="目标价格",
+                )
+            with c_type:
+                reminder_type = st.selectbox(
+                    "类型",
+                    ["PRICE_DOWN", "PRICE_UP"],
+                    key=f"type_{ticker}",
+                    label_visibility="collapsed",
+                )
+            with c_btn:
+                submit = st.button("设置", key=f"alert_custom_{ticker}", width="stretch")
+
+            note = st.text_input("备注", value="", placeholder="备注(可选)", key=f"note_{ticker}", label_visibility="collapsed")
+
+        if submit:
+            if custom_price <= 0:
+                st.error("请输入有效的目标价格")
+            else:
+                try:
+                    with FutuClient() as client:
+                        code = FutuClient.build_code(ticker, "US")
+                        success, msg = client.set_price_alert(code, custom_price, note=note, reminder_type=reminder_type)
+                        if success:
+                            st.success(f"提醒已设置: ${custom_price:.2f} ({reminder_type}) - {msg}")
+                        else:
+                            st.error(f"设置失败: {msg}")
+                except Exception as e:
+                    st.error(f"连接错误: {str(e)[:50]}")
+    
+    except Exception as e:
+        st.warning(f"价格提醒功能暂不可用: {str(e)[:50]}")
+
+
+def _render_metrics_panel(ticker: str, df_ohlcv: pd.DataFrame, df_fund: pd.DataFrame) -> None:
+    """Render right-side compact metrics without oversized cards."""
+    with st.container():
+        # Fetch supporting data
+        company = get_company(ticker)
+        fmp_dcf_hist = get_fmp_dcf_history(ticker)
+
+        # Latest price
+        latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
+        latest_price_text = f"${latest_price:,.2f}" if latest_price else "—"
+        
+        # Market cap
+        market_cap = company.get("market_cap") if company else None
+        if market_cap and market_cap > 0:
+            mcap_display = f"${market_cap:,.0f}M" if market_cap >= 1000 else f"${market_cap:,.0f}M"
+        else:
+            mcap_display = "—"
+        market_cap_text = mcap_display
+        
+        # Latest and average FCF
+        if not df_fund.empty:
+            df_fund_sorted = df_fund.sort_values("fiscal_year", ascending=False)
+            latest_fcf_ps = df_fund_sorted.iloc[0].get("fcf_per_share")
+            if latest_fcf_ps is not None:
+                latest_fcf_ps = float(latest_fcf_ps)
+                latest_fcf_text = f"${latest_fcf_ps:,.2f}"
+            else:
+                latest_fcf_text = "—"
+            
+            # 3-year average FCF
+            if len(df_fund_sorted) >= 3:
+                avg_fcf = df_fund_sorted.head(3)["fcf_per_share"].astype(float).mean()
+            else:
+                avg_fcf = df_fund_sorted["fcf_per_share"].astype(float).mean()
+            
+            if not pd.isna(avg_fcf) and avg_fcf > 0:
+                avg_fcf_text = f"${avg_fcf:,.2f}"
+            else:
+                avg_fcf_text = "—"
+        else:
+            latest_fcf_text = "—"
+            avg_fcf_text = "—"
+
+        # FMP DCF latest
+        if not fmp_dcf_hist.empty:
+            fmp_latest = fmp_dcf_hist.iloc[-1]
+            fmp_dcf_val = float(fmp_latest.get("dcf_value", 0))
+            fmp_dcf_text = f"${fmp_dcf_val:,.2f}" if fmp_dcf_val > 0 else "—"
+        else:
+            fmp_dcf_text = "—"
+
+        metrics_html = (
+            '<div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;'
+            'background:#0f1629;border:1px solid #1e3a5f;border-radius:8px;padding:8px 10px;margin:2px 0 8px;">'
+            f'<div><div style="color:#64748b;font-size:.64rem;">最新价格</div><div style="color:#e0e7ff;font-size:1.02rem;font-weight:800;line-height:1.2;">{latest_price_text}</div></div>'
+            f'<div><div style="color:#64748b;font-size:.64rem;">市值</div><div style="color:#e0e7ff;font-size:1.02rem;font-weight:800;line-height:1.2;">{market_cap_text}</div></div>'
+            f'<div><div style="color:#64748b;font-size:.64rem;">3年平均FCF/S</div><div style="color:#e0e7ff;font-size:1.02rem;font-weight:800;line-height:1.2;">{avg_fcf_text}</div></div>'
+            f'<div><div style="color:#64748b;font-size:.64rem;">FMP DCF估值</div><div style="color:#e879f9;font-size:1.02rem;font-weight:900;line-height:1.2;">{fmp_dcf_text}</div></div>'
+            '</div>'
+        )
+        st.markdown(metrics_html, unsafe_allow_html=True)
+
+
+def render_d1_us() -> None:
+    st.subheader("D1: 价格图线")
+    ticker_df = get_all_tickers(market="US")
+    ticker_options = sorted(ticker_df["ticker"].dropna().astype(str).unique().tolist()) if not ticker_df.empty else []
+    default_ticker = st.session_state.get("d1_us_ticker", "NVDA").strip().upper()
+    if default_ticker and default_ticker not in ticker_options:
+        ticker_options = [default_ticker] + ticker_options
+    if not ticker_options:
+        ticker_options = ["NVDA"]
+
+    # Main layout: chart ~70%, right panel ~30%
+    col_left, col_right = st.columns([7, 3], gap="medium")
+
+    with col_right:
+        # Same row: ticker + start_date + refresh
+        c_tk, c_dt, c_rf = st.columns([1.4, 1.1, 0.7], gap="small")
+        with c_tk:
+            ticker = st.selectbox(
+            "Ticker",
+            options=ticker_options,
+            index=ticker_options.index(default_ticker) if default_ticker in ticker_options else 0,
+            key="d1_us_ticker_select",
+            help="输入字符可搜索股票代码",
+            label_visibility="collapsed",
+            )
+        st.session_state["d1_us_ticker"] = ticker
+        with c_dt:
+            start_date = st.date_input("起始日期", value=pd.Timestamp("2018-01-01"), key="d1_us_start", label_visibility="collapsed")
+        with c_rf:
+            st.markdown('<div style="margin-top:-8px"></div>', unsafe_allow_html=True)
+            do_refresh = st.button("刷新", key=f"refresh_top_{ticker}", type="secondary", width="stretch")
+
+    if do_refresh:
+        success, msg = _refresh_latest_fmp_data(ticker)
+        if success:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    df_ohlcv = get_ohlcv(ticker, start_date=str(start_date))
+    if df_ohlcv.empty:
+        with col_left:
+            st.info("本地数据库暂无该 ticker 的行情数据。请先在命令行完成 ETL。")
+        return
+
+    df_ohlcv = _ensure_ema_columns(df_ohlcv)
+    df_fund = get_fundamentals(ticker)
+    df_dcf_hist = get_dcf_history(ticker)
+    if df_dcf_hist.empty:
+        df_dcf_hist = _build_dcf_history_fallback(df_fund, df_ohlcv, ticker)
+    df_fmp_dcf = get_fmp_dcf_history(ticker)
+    fig = _build_chart(df_ohlcv, df_dcf_hist, df_fmp_dcf, ticker=ticker)
+
+    with col_left:
+        st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
+        _render_notes_panel_d1(ticker)
+
+    with col_right:
+        _render_metrics_panel(ticker, df_ohlcv, df_fund)
+        latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
+        _render_analyst_panel_d1(ticker, latest_price)
+        dcf_metrics = get_dcf_metrics(ticker)
+        _render_price_alert_panel_d1(ticker, dcf_metrics)

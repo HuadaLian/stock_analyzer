@@ -1,0 +1,24 @@
+============================= test session starts =============================
+platform win32 -- Python 3.10.19, pytest-9.0.3, pluggy-1.6.0 -- C:\Users\huada\anaconda3\envs\stock_analyzer\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\huada\stock_analyzer
+plugins: anyio-4.13.0
+collecting ... collected 15 items
+
+tests/db/test_all_tables_exist_with_correct_columns.py::test_all_expected_tables_exist PASSED [  6%]
+tests/db/test_all_tables_exist_with_correct_columns.py::test_table_has_correct_columns[companies-columns0] PASSED [ 13%]
+tests/db/test_all_tables_exist_with_correct_columns.py::test_table_has_correct_columns[ohlcv_daily-columns1] PASSED [ 20%]
+tests/db/test_all_tables_exist_with_correct_columns.py::test_table_has_correct_columns[fundamentals_annual-columns2] PASSED [ 26%]
+tests/db/test_all_tables_exist_with_correct_columns.py::test_table_has_correct_columns[fundamentals_quarterly-columns3] PASSED [ 33%]
+tests/db/test_all_tables_exist_with_correct_columns.py::test_table_has_correct_columns[estimates-columns4] PASSED [ 40%]
+tests/db/test_all_tables_exist_with_correct_columns.py::test_table_has_correct_columns[dcf_metrics-columns5] PASSED [ 46%]
+tests/db/test_all_tables_exist_with_correct_columns.py::test_table_has_correct_columns[factor_scores-columns6] PASSED [ 53%]
+tests/db/test_all_tables_exist_with_correct_columns.py::test_table_has_correct_columns[notes-columns7] PASSED [ 60%]
+tests/db/test_primary_key_prevents_duplicate_rows.py::test_companies_rejects_duplicate_ticker PASSED [ 66%]
+tests/db/test_primary_key_prevents_duplicate_rows.py::test_fundamentals_annual_rejects_duplicate_ticker_and_year PASSED [ 73%]
+tests/db/test_primary_key_prevents_duplicate_rows.py::test_ohlcv_daily_rejects_duplicate_ticker_and_date PASSED [ 80%]
+tests/db/test_repository_returns_empty_not_error_on_unknown_ticker.py::test_get_ohlcv_unknown_ticker_returns_empty_dataframe PASSED [ 86%]
+tests/db/test_repository_returns_empty_not_error_on_unknown_ticker.py::test_get_fundamentals_unknown_ticker_returns_empty_dataframe PASSED [ 93%]
+tests/db/test_repository_returns_empty_not_error_on_unknown_ticker.py::test_get_dcf_metrics_unknown_ticker_returns_none PASSED [100%]
+
+============================= 15 passed in 0.78s ==============================
