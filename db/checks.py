@@ -175,7 +175,8 @@ def print_report(r: TickerCompleteness) -> None:
     print(f"D1 readiness -> EMA:{r.d1_ema_ready} DCF:{r.d1_dcf_ready} FMP_DCF:{r.d1_fmp_dcf_ready}")
 
 
-def _list_distinct_tickers(conn) -> list[str]:
+def list_distinct_data_tickers(conn) -> list[str]:
+    """Tickers that appear in any D1-related table (same universe as ``--all``)."""
     rows = conn.execute(
         """
         SELECT DISTINCT ticker
@@ -194,6 +195,10 @@ def _list_distinct_tickers(conn) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
+def _list_distinct_tickers(conn) -> list[str]:
+    return list_distinct_data_tickers(conn)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check DB completeness for D1/data-readiness")
     parser.add_argument("--ticker", help="Ticker to inspect, e.g. NVDA")
@@ -206,7 +211,7 @@ def main() -> None:
 
     with get_conn(readonly=True) as conn:
         if args.all:
-            reports = [check_ticker(conn, t) for t in _list_distinct_tickers(conn)]
+            reports = [check_ticker(conn, t) for t in list_distinct_data_tickers(conn)]
             if args.json:
                 print(json.dumps([asdict(r) for r in reports], ensure_ascii=False, indent=2))
             else:

@@ -9,8 +9,14 @@ dcf_history / fmp_dcf_history。
 import pytest
 
 
-COMPANY_ROW = ("NVDA", "US", "NVIDIA Corporation", "NASDAQ",
-               "Technology", "Semiconductors", "USD", "GPU maker", 24500.0, None)
+COMPANY_COLS = [
+    "ticker", "market", "name", "exchange", "exchange_full_name", "country",
+    "sector", "industry", "currency", "description", "shares_out", "updated_at",
+]
+COMPANY_ROW = (
+    "NVDA", "US", "NVIDIA Corporation", "NASDAQ", "NASDAQ Global Select", "United States",
+    "Technology", "Semiconductors", "USD", "GPU maker", 24500.0, None,
+)
 
 FUNDAMENTAL_COLS = [
     "ticker", "fiscal_year", "fiscal_end_date", "filing_date",
@@ -35,7 +41,8 @@ FMP_DCF_ROW = ("NVDA", "2024-12-31", 80.0, 100.0)
 
 
 def test_companies_rejects_duplicate_ticker(in_memory_db):
-    sql = """INSERT INTO companies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+    ph = ", ".join(["?"] * len(COMPANY_COLS))
+    sql = f"INSERT INTO companies ({', '.join(COMPANY_COLS)}) VALUES ({ph})"
     in_memory_db.execute(sql, COMPANY_ROW)
     with pytest.raises(Exception):
         in_memory_db.execute(sql, COMPANY_ROW)

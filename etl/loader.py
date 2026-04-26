@@ -19,21 +19,24 @@ import duckdb
 def upsert_company(conn: duckdb.DuckDBPyConnection, data: dict) -> None:
     conn.execute("""
         INSERT INTO companies
-            (ticker, market, name, exchange, sector, industry,
-             currency, description, shares_out, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+            (ticker, market, name, exchange, exchange_full_name, country,
+             sector, industry, currency, description, shares_out, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
         ON CONFLICT (ticker) DO UPDATE SET
-            market      = excluded.market,
-            name        = excluded.name,
-            exchange    = excluded.exchange,
-            sector      = excluded.sector,
-            industry    = excluded.industry,
-            currency    = excluded.currency,
-            description = excluded.description,
-            shares_out  = excluded.shares_out,
-            updated_at  = excluded.updated_at
+            market               = excluded.market,
+            name                 = excluded.name,
+            exchange             = excluded.exchange,
+            exchange_full_name   = excluded.exchange_full_name,
+            country              = excluded.country,
+            sector               = excluded.sector,
+            industry             = excluded.industry,
+            currency             = excluded.currency,
+            description          = excluded.description,
+            shares_out           = excluded.shares_out,
+            updated_at           = excluded.updated_at
     """, [
-        data["ticker"], data["market"], data["name"], data["exchange"],
+        data["ticker"], data["market"], data["name"], data.get("exchange"),
+        data.get("exchange_full_name"), data.get("country"),
         data["sector"], data["industry"], data["currency"], data["description"],
         data["shares_out"],
     ])
@@ -192,3 +195,84 @@ def upsert_fmp_dcf_history(conn: duckdb.DuckDBPyConnection, rows: list[dict]) ->
             dcf_value   = excluded.dcf_value,
             stock_price = excluded.stock_price
     """, [[r["ticker"], r["date"], r["dcf_value"], r["stock_price"]] for r in rows])
+
+
+def upsert_management(conn: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
+    """Upsert management rows keyed by (ticker, title)."""
+    if not rows:
+        return
+    ticker = rows[0]["ticker"]
+    conn.execute("DELETE FROM management WHERE ticker = ?", [ticker])
+    conn.executemany("""
+        INSERT INTO management (ticker, name, title, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (ticker, title) DO UPDATE SET
+            name       = excluded.name,
+            updated_at = excluded.updated_at
+    """, [[r["ticker"], r["name"], r["title"], r["updated_at"]] for r in rows])
+
+
+def upsert_revenue_by_segment(conn: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
+    """Upsert revenue by segment keyed by (ticker, fiscal_year, segment)."""
+    if not rows:
+        return
+    ticker = rows[0]["ticker"]
+    conn.execute("DELETE FROM revenue_by_segment WHERE ticker = ?", [ticker])
+    conn.executemany("""
+        INSERT INTO revenue_by_segment (ticker, fiscal_year, segment, revenue, pct)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (ticker, fiscal_year, segment) DO UPDATE SET
+            revenue = excluded.revenue,
+            pct     = excluded.pct
+    """, [[r["ticker"], r["fiscal_year"], r["segment"], r["revenue"], r["pct"]] for r in rows])
+
+
+def upsert_revenue_by_geography(conn: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
+    """Upsert revenue by geography keyed by (ticker, fiscal_year, region)."""
+    if not rows:
+        return
+    ticker = rows[0]["ticker"]
+    conn.execute("DELETE FROM revenue_by_geography WHERE ticker = ?", [ticker])
+    conn.executemany("""
+        INSERT INTO revenue_by_geography (ticker, fiscal_year, region, revenue, pct)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (ticker, fiscal_year, region) DO UPDATE SET
+            revenue = excluded.revenue,
+            pct     = excluded.pct
+    """, [[r["ticker"], r["fiscal_year"], r["region"], r["revenue"], r["pct"]] for r in rows])
+
+
+def upsert_interest_expense_annual(conn: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
+    """Upsert annual interest expense into fundamentals_annual."""
+    if not rows:
+        return
+    conn.executemany("""
+        INSERT INTO fundamentals_annual (ticker, fiscal_year, interest_expense)
+        VALUES (?, ?, ?)
+        ON CONFLICT (ticker, fiscal_year) DO UPDATE SET
+            interest_expense = excluded.interest_expense
+    """, [[r["ticker"], r["fiscal_year"], r["interest_expense"]] for r in rows])
+
+
+def upsert_income_statement_annual(conn: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
+    """Upsert annual revenue and EBITDA inputs into fundamentals_annual."""
+    if not rows:
+        return
+    conn.executemany("""
+        INSERT INTO fundamentals_annual (
+            ticker, fiscal_year, revenue, operating_income, depreciation, interest_expense
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (ticker, fiscal_year) DO UPDATE SET
+            revenue          = excluded.revenue,
+            operating_income = excluded.operating_income,
+            depreciation     = excluded.depreciation,
+            interest_expense = COALESCE(excluded.interest_expense, fundamentals_annual.interest_expense)
+    """, [[
+        r["ticker"],
+        r["fiscal_year"],
+        r.get("revenue"),
+        r.get("operating_income"),
+        r.get("depreciation"),
+        r.get("interest_expense"),
+    ] for r in rows])

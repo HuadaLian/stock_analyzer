@@ -17,6 +17,8 @@ def test_fetch_profile_converts_shares_to_millions(mock_fmp):
     mock_fmp.set("profile", [{
         "companyName": "NVIDIA Corporation",
         "exchange": "NASDAQ",
+        "exchangeFullName": "NASDAQ Global Select",
+        "country": "US",
         "sector": "Technology",
         "industry": "Semiconductors",
         "currency": "usd",
@@ -39,6 +41,10 @@ def test_fetch_profile_converts_shares_to_millions(mock_fmp):
     assert profile["currency"] == "USD"
     # market 固定为 US (Phase 2 仅美股)
     assert profile["market"] == "US"
+    assert profile["country"] == "US"
+    assert profile["exchange_full_name"] == "NASDAQ Global Select"
+    assert profile.get("_is_etf") is False
+    assert profile.get("_is_fund") is False
 
 
 def test_fetch_profile_falls_back_to_alternate_field_names(mock_fmp):

@@ -16,6 +16,7 @@ dist/
 sec-edgar-filings/
 SEC_Filings/
 CN_Fillings/
+stock.db
 
 # --- 敏感信息 ---
 .env
@@ -287,3 +288,22 @@ CN_Fillings/
 /.claude/settings.local.json
 /.claude/settings.local.json
 /.claude/*
+/plans/*
+/reports/*
+/reports/db_quality_cache/audit_subprocess.log
+/reports/__init__.py
+/reports/_db_report_once.py
+/reports/.gitkeep
+/reports/run_db_quality_audit.py
+/reports/us_etl_watch.log
+/logs/*
+/logs/bulk_stderr.log
+/logs/bulk_stdout.log
+/logs/us_bulk_20260426_015117.log
+/logs/us_bulk_20260426_111036.log
+/logs/us_bulk_20260426_111643.log
+/logs/us_bulk_20260426_115411.log
+/stock_read.db
+/stock.db
+/stock.db.wal
+/stock.db

@@ -3,8 +3,19 @@ import streamlit as st
 import pandas as pd
 import os
 import time
+
+# Auto-detect read replica BEFORE anything else can call get_conn(readonly=True).
+# If STOCK_ANALYZER_READ_DB is unset and stock_read.db exists next to stock.db,
+# point the env at it so this Streamlit session reads the snapshot (lets bulk
+# keep running concurrently). User-set env vars are preserved.
+from dashboards.db_status import bootstrap_read_replica, render_status_caption
+from dashboards.db_quality import render_db_quality_tab
+bootstrap_read_replica()
+
 from analyzers import USAnalyzer, CNAnalyzer, HKAnalyzer
 from dashboards.d1_fcf_multiple import render_d1_us
+from dashboards.d2_business import render_d2_us
+from dashboards.d3_industry import render_d3_us
 from chart_store import load_chart
 from analysis_tracker import get_analyzed_tickers
 from gemini_chat import (
@@ -16,6 +27,9 @@ from gemini_chat import (
 
 # ── Page config ──────────────────────────────────────────────────────────
 st.set_page_config(page_title="Stock Analyzer", layout="wide")
+
+# ── Data-source status (副本/主库 + freshness) ─────────────────────────────
+render_status_caption(st)
 
 # ── Modern CSS ───────────────────────────────────────────────────────────
 st.markdown("""
@@ -202,9 +216,9 @@ if "_sid" not in st.session_state:
     st.session_state["_sid"] = str(_uuid.uuid4())
 
 # ── Tabs ─────────────────────────────────────────────────────────────────
-tab_us, tab_cn, tab_hk, tab_reviewed, tab_settings = st.tabs([
+tab_us, tab_cn, tab_hk, tab_reviewed, tab_db_quality, tab_settings = st.tabs([
     "🇺🇸 美股分析中心", "🇨🇳 A股分析中心", "🇭🇰 港股分析中心",
-    "📋 已分析股票", "⚙️ 设置",
+    "📋 已分析股票", "🧪 数据库质量检测", "⚙️ 设置",
 ])
 
 # =====================================================================
@@ -215,7 +229,13 @@ with tab_us:
     with tab_us_legacy:
         USAnalyzer().run()
     with tab_us_d1:
-        render_d1_us()
+        ticker = render_d1_us()
+        st.divider()
+        col_d2, col_d3 = st.columns([1, 1], gap="medium")
+        with col_d2:
+            render_d2_us(ticker)
+        with col_d3:
+            render_d3_us(ticker)
 
 # =====================================================================
 #  A股
@@ -650,6 +670,13 @@ with tab_reviewed:
 
     with rev_hk:
         _render_reviewed_market("HK", HKAnalyzer(), None)
+
+
+# =====================================================================
+#  数据库质量检测（读取后台脚本写入的缓存报告）
+# =====================================================================
+with tab_db_quality:
+    render_db_quality_tab(st)
 
 
 # =====================================================================

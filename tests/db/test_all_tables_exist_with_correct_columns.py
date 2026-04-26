@@ -8,6 +8,7 @@
 import pytest
 
 EXPECTED_TABLES = {
+    "etl_us_bulk_state",
     "companies",
     "ohlcv_daily",
     "ohlcv_minute",
@@ -31,9 +32,17 @@ EXPECTED_COLUMNS = {
     "companies": {
         "ticker": "VARCHAR",
         "market": "VARCHAR",
+        "exchange": "VARCHAR",
+        "exchange_full_name": "VARCHAR",
+        "country": "VARCHAR",
         "sector": "VARCHAR",
         "industry": "VARCHAR",
         "shares_out": "DOUBLE",
+    },
+    "etl_us_bulk_state": {
+        "ticker": "VARCHAR",
+        "status": "VARCHAR",
+        "step": "VARCHAR",
     },
     "ohlcv_daily": {
         "ticker": "VARCHAR",

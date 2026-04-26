@@ -10,11 +10,16 @@ Three functions used by Phase 2:
 
 from __future__ import annotations
 
+import logging
 import os
 import requests
+from datetime import date
 from pathlib import Path
 
 _FMP_BASE = "https://financialmodelingprep.com/stable"
+ANNUAL_HISTORY_LIMIT = 15
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +56,36 @@ def _get(endpoint: str, **params) -> list | dict:
 # fetch_profile  →  companies table
 # ---------------------------------------------------------------------------
 
+def _as_profile_dict(raw, ticker: str) -> dict | None:
+    """Normalize FMP /profile responses to a single dict (or None).
+
+    FMP occasionally returns shapes other than the documented [dict] — empty
+    list, list of multiple entries, or even None — and the previous code did
+    `data[0]` blindly, which crashed callers with a bare AttributeError on the
+    next `.get`. This helper folds every shape into either a dict or None so
+    `fetch_profile` can raise a clean ValueError that bulk records as `failed`.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        if not raw:
+            return None
+        sym = ticker.upper()
+        for entry in raw:
+            if isinstance(entry, dict) and str(entry.get("symbol", "")).upper() == sym:
+                return entry
+        first = raw[0]
+        if isinstance(first, dict):
+            if len(raw) > 1:
+                _log.warning(
+                    "FMP profile returned %d entries for %s; using first (no symbol match)",
+                    len(raw), sym,
+                )
+            return first
+        return None
+    return None
+
+
 def fetch_profile(ticker: str) -> dict:
     """
     Returns dict matching companies table columns.
@@ -60,7 +95,10 @@ def fetch_profile(ticker: str) -> dict:
     - shares_out stored in millions.
     """
     data = _get("profile", symbol=ticker)
-    p = data[0] if isinstance(data, list) and data else data
+    p = _as_profile_dict(data, ticker)
+    if p is None:
+        shape = type(data).__name__ + (f"[{len(data)}]" if isinstance(data, list) else "")
+        raise ValueError(f"FMP profile returned no usable dict for {ticker.upper()} (shape={shape})")
 
     shares_raw = p.get("sharesOutstanding") or p.get("outstandingShares") or 0
     mkt_cap    = p.get("mktCap") or p.get("marketCap")
@@ -73,11 +111,16 @@ def fetch_profile(ticker: str) -> dict:
         except (TypeError, ZeroDivisionError):
             shares_raw = 0
 
+    ex_short = p.get("exchangeShortName") or p.get("exchange")
+    ex_full = (p.get("exchangeFullName") or p.get("fullExchangeName") or "").strip() or None
+
     return {
         "ticker":      ticker.upper(),
         "market":      "US",
         "name":        p.get("companyName") or p.get("name"),
-        "exchange":    p.get("exchange") or p.get("exchangeShortName"),
+        "exchange":    ex_short,
+        "exchange_full_name": ex_full,
+        "country":     (p.get("country") or "").strip() or None,
         "sector":      p.get("sector"),
         "industry":    p.get("industry"),
         "currency":    (p.get("currency") or "USD").upper(),
@@ -86,6 +129,8 @@ def fetch_profile(ticker: str) -> dict:
         # market_cap not in companies table; used for ohlcv_daily.market_cap
         "_shares_out_raw": float(shares_raw) if shares_raw else None,
         "_market_cap":     float(mkt_cap) if mkt_cap else None,
+        "_is_etf":       bool(p.get("isEtf")),
+        "_is_fund":      bool(p.get("isFund")),
     }
 
 
@@ -207,7 +252,11 @@ def _rate_on_or_before(fx_dict: dict[str, float], target_date: str) -> float:
 # fetch_fcf_annual  →  fundamentals_annual table (FCF columns only)
 # ---------------------------------------------------------------------------
 
-def fetch_fcf_annual(ticker: str, shares_out_raw: float | None = None) -> list[dict]:
+def fetch_fcf_annual(
+    ticker: str,
+    shares_out_raw: float | None = None,
+    date_from: str | None = None,
+) -> list[dict]:
     """
     Returns list of dicts for fundamentals_annual, FCF columns only.
     Other columns (revenue, roic, etc.) are left as None for later phases.
@@ -225,7 +274,18 @@ def fetch_fcf_annual(ticker: str, shares_out_raw: float | None = None) -> list[d
         fcf_per_share in USD
         shares_out   in millions  (weighted avg basic, from FMP field)
     """
-    data = _get("cash-flow-statement", symbol=ticker, period="annual", limit=30)
+    params: dict[str, str | int] = {
+        "symbol": ticker,
+        "period": "annual",
+        "limit": ANNUAL_HISTORY_LIMIT,
+    }
+    if date_from:
+        params["from"] = date_from
+
+    data = _get(
+        "cash-flow-statement",
+        **params,
+    )
     if not data or not isinstance(data, list):
         raise ValueError(f"FMP returned no cash flow data for {ticker}")
 
@@ -302,6 +362,245 @@ def fetch_fcf_annual(ticker: str, shares_out_raw: float | None = None) -> list[d
             "roic":                      None,
             "return_on_capital":         None,
             "return_on_equity":          None,
+        })
+
+    return rows
+
+
+def _extract_numeric_breakdown(entry: dict, exclude_keys: set[str]) -> dict[str, float]:
+    """Extract non-meta numeric fields from a segmentation payload entry."""
+    out: dict[str, float] = {}
+    for key, value in entry.items():
+        if key in exclude_keys:
+            continue
+        if isinstance(value, (int, float)):
+            out[str(key)] = float(value)
+    return out
+
+
+def _parse_revenue_breakdown_rows(
+    ticker: str,
+    data: list | dict,
+    dim_field: str,
+) -> list[dict]:
+    """Parse FMP segment/geography payloads into normalized rows.
+
+    Handles common FMP shapes:
+    1) [{"date": "2024-12-31", "SegmentA": 1.0, "SegmentB": 2.0}, ...]
+    2) [{"2024-12-31": {"SegmentA": 1.0, "SegmentB": 2.0}}, ...]
+    """
+    rows: list[dict] = []
+    payload = data if isinstance(data, list) else [data]
+    exclude = {"date", "calendarYear", "fiscalYear", "symbol", "reportedCurrency", "fillingDate", "filingDate", "period", "finalLink", "link", "data"}
+
+    def _append_for_year(fiscal_year: int, values: dict[str, float]) -> None:
+        if not values:
+            return
+        total = sum(v for v in values.values() if v is not None)
+        if total == 0:
+            return
+        for label, raw_value in values.items():
+            if raw_value is None:
+                continue
+            revenue_m = raw_value / 1_000_000
+            pct = (raw_value / total) if total else None
+            rows.append({
+                "ticker": ticker.upper(),
+                "fiscal_year": fiscal_year,
+                dim_field: label,
+                "revenue": revenue_m,
+                "pct": pct,
+            })
+
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+
+        # Shape: {fiscalYear/date, ..., data: {SegmentA: value, SegmentB: value}}
+        if isinstance(item.get("data"), dict):
+            year_text = str(item.get("fiscalYear") or item.get("calendarYear") or str(item.get("date", ""))[:4])
+            if year_text.isdigit():
+                fiscal_year = int(year_text)
+                values = _extract_numeric_breakdown(item["data"], set())
+                _append_for_year(fiscal_year, values)
+                continue
+
+        if "date" in item or "calendarYear" in item:
+            year_text = str(item.get("calendarYear") or str(item.get("date", ""))[:4])
+            if not year_text.isdigit():
+                continue
+            fiscal_year = int(year_text)
+            values = _extract_numeric_breakdown(item, exclude)
+            _append_for_year(fiscal_year, values)
+            continue
+
+        for key, val in item.items():
+            key_s = str(key)
+            if len(key_s) >= 4 and key_s[:4].isdigit() and isinstance(val, dict):
+                fiscal_year = int(key_s[:4])
+                values = _extract_numeric_breakdown(val, set())
+                _append_for_year(fiscal_year, values)
+
+    return rows
+
+
+def fetch_revenue_by_segment(ticker: str) -> list[dict]:
+    """Fetch annual revenue by business segment and normalize for DB."""
+    data = _get("revenue-product-segmentation", symbol=ticker)
+    rows = _parse_revenue_breakdown_rows(ticker, data, dim_field="segment")
+    return rows
+
+
+def fetch_revenue_by_geography(ticker: str) -> list[dict]:
+    """Fetch annual revenue by geography and normalize for DB."""
+    data = _get("revenue-geographic-segmentation", symbol=ticker)
+    rows = _parse_revenue_breakdown_rows(ticker, data, dim_field="region")
+    return rows
+
+
+def fetch_management(ticker: str) -> list[dict]:
+    """Fetch key executives and normalize for management table."""
+    data = _get("key-executives", symbol=ticker)
+    payload = data if isinstance(data, list) else [data]
+
+    rows: list[dict] = []
+    title_seen: dict[str, int] = {}
+    today = date.today().isoformat()
+
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or "").strip()
+        title = (item.get("title") or item.get("position") or "").strip()
+        if not name:
+            continue
+        if not title:
+            title = f"Executive {len(rows) + 1}"
+
+        count = title_seen.get(title, 0) + 1
+        title_seen[title] = count
+        title_key = title if count == 1 else f"{title} ({count})"
+
+        rows.append({
+            "ticker": ticker.upper(),
+            "name": name,
+            "title": title_key,
+            "updated_at": today,
+        })
+
+    return rows
+
+
+def fetch_interest_expense_annual(ticker: str, date_from: str | None = None) -> list[dict]:
+    """Fetch annual interest expense from income statement endpoint, FX-converted to USD millions."""
+    params: dict[str, str | int] = {
+        "symbol": ticker,
+        "period": "annual",
+        "limit": ANNUAL_HISTORY_LIMIT,
+    }
+    if date_from:
+        params["from"] = date_from
+
+    data = _get(
+        "income-statement",
+        **params,
+    )
+    if not data or not isinstance(data, list):
+        return []
+
+    reporting = (data[0].get("reportedCurrency") or "USD").upper()
+    fx_by_date: dict[str, float] = {}
+    if reporting != "USD":
+        report_dates = [str(e.get("date") or "")[:10] for e in data if e.get("date")]
+        if report_dates:
+            try:
+                fx_by_date = fetch_fx_to_usd(reporting, min(report_dates), max(report_dates))
+            except RuntimeError:
+                fx_by_date = {}
+
+    rows: list[dict] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        date_str = str(entry.get("date") or "")
+        if len(date_str) < 4 or not date_str[:4].isdigit():
+            continue
+
+        value = entry.get("interestExpense")
+        if value is None:
+            value = entry.get("interestExpenseNonOperating")
+        if value is None:
+            continue
+
+        rate = _rate_on_or_before(fx_by_date, date_str[:10]) if reporting != "USD" else 1.0
+        rows.append({
+            "ticker": ticker.upper(),
+            "fiscal_year": int(date_str[:4]),
+            "interest_expense": float(value) * rate / 1_000_000,
+        })
+
+    return rows
+
+
+def fetch_income_statement_annual(ticker: str, date_from: str | None = None) -> list[dict]:
+    """Fetch annual income statement fields required by D2/D3, FX-converted to USD millions.
+
+    For non-USD reporters (e.g. TSM in TWD) the raw values are converted using the
+    historical FX rate effective on each fiscal_end_date — same convention as
+    fetch_fcf_annual — so all figures stored in fundamentals_annual share the USD basis."""
+    params: dict[str, str | int] = {
+        "symbol": ticker,
+        "period": "annual",
+        "limit": ANNUAL_HISTORY_LIMIT,
+    }
+    if date_from:
+        params["from"] = date_from
+
+    data = _get(
+        "income-statement",
+        **params,
+    )
+    if not data or not isinstance(data, list):
+        return []
+
+    reporting = (data[0].get("reportedCurrency") or "USD").upper()
+    fx_by_date: dict[str, float] = {}
+    if reporting != "USD":
+        report_dates = [str(e.get("date") or "")[:10] for e in data if e.get("date")]
+        if report_dates:
+            try:
+                fx_by_date = fetch_fx_to_usd(reporting, min(report_dates), max(report_dates))
+            except RuntimeError:
+                fx_by_date = {}
+
+    rows: list[dict] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+
+        date_str = str(entry.get("date") or "")
+        if len(date_str) < 4 or not date_str[:4].isdigit():
+            continue
+
+        rate = _rate_on_or_before(fx_by_date, date_str[:10]) if reporting != "USD" else 1.0
+
+        def _to_usd_m(value):
+            if value is None:
+                return None
+            return float(value) * rate / 1_000_000
+
+        interest = entry.get("interestExpense")
+        if interest is None:
+            interest = entry.get("interestExpenseNonOperating")
+
+        rows.append({
+            "ticker": ticker.upper(),
+            "fiscal_year": int(date_str[:4]),
+            "fiscal_end_date": date_str[:10],
+            "revenue": _to_usd_m(entry.get("revenue")),
+            "operating_income": _to_usd_m(entry.get("operatingIncome")),
+            "depreciation": _to_usd_m(entry.get("depreciationAndAmortization")),
+            "interest_expense": _to_usd_m(interest),
         })
 
     return rows

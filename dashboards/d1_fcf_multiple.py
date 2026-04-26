@@ -19,9 +19,9 @@ from db.repository import (
     get_fmp_dcf_history,
     get_company,
     get_dcf_metrics,
-    get_all_tickers,
 )
 from db.schema import get_conn
+from dashboards.cache import get_all_tickers_cached
 from etl.loader import upsert_ohlcv_daily, upsert_ohlcv_ema, upsert_fmp_dcf_history
 from etl.sources.fmp_dcf import fetch_fmp_dcf_history
 from etl.sources.fmp import fetch_profile, fetch_ohlcv
@@ -168,37 +168,22 @@ def _build_chart(df_ohlcv: pd.DataFrame,
                 connectgaps=True,
             ))
 
+    latest_fmp = None
     if not df_fmp_dcf.empty:
-        fmp = df_fmp_dcf.sort_values("date").copy()
-        fmp["date"] = pd.to_datetime(fmp["date"])
-        xs = list(fmp["date"])
-        ys = list(fmp["dcf_value"])
-        if ys:
-            xs.append(pd.Timestamp(datetime.now().date()))
-            ys.append(ys[-1])
-        fig.add_trace(go.Scatter(
-            x=xs,
-            y=ys,
-            name="FMP DCF",
-            line=dict(color="#e879f9", width=2, dash="dot"),
-            mode="lines+markers",
-            marker=dict(size=7, symbol="circle", color="#e879f9"),
-            connectgaps=True,
-        ))
-
-        # Force a clearly visible reference line from latest DB value.
-        latest_fmp = float(pd.to_numeric(fmp["dcf_value"], errors="coerce").dropna().iloc[-1])
-        ohlcv_dates = pd.to_datetime(df_ohlcv["date"])
-        x0 = ohlcv_dates.min()
-        x1 = max(ohlcv_dates.max(), pd.Timestamp(datetime.now().date()))
-        fig.add_trace(go.Scatter(
-            x=[x0, x1],
-            y=[latest_fmp, latest_fmp],
-            name="FMP DCF(最新)",
-            line=dict(color="#ff4dd2", width=2.6, dash="dot"),
-            mode="lines",
-            hovertemplate="FMP DCF(最新): $%{y:,.2f}<extra></extra>",
-        ))
+        fmp_vals = pd.to_numeric(df_fmp_dcf["dcf_value"], errors="coerce").dropna()
+        if not fmp_vals.empty:
+            latest_fmp = float(fmp_vals.iloc[-1])
+            ohlcv_dates = pd.to_datetime(df_ohlcv["date"])
+            x0 = ohlcv_dates.min()
+            x1 = max(ohlcv_dates.max(), pd.Timestamp(datetime.now().date()))
+            fig.add_trace(go.Scatter(
+                x=[x0, x1],
+                y=[latest_fmp, latest_fmp],
+                name="FMP DCF",
+                line=dict(color="#ff4dd2", width=2.6, dash="dot"),
+                mode="lines",
+                hovertemplate="FMP DCF: $%{y:,.2f}<extra></extra>",
+            ))
 
     annotations = []
     if latest_price is not None:
@@ -228,8 +213,8 @@ def _build_chart(df_ohlcv: pd.DataFrame,
             if col in df_dcf_hist.columns:
                 y_candidates.extend(pd.to_numeric(df_dcf_hist[col], errors="coerce").dropna().tolist())
 
-    if not df_fmp_dcf.empty and "dcf_value" in df_fmp_dcf.columns:
-        y_candidates.extend(pd.to_numeric(df_fmp_dcf["dcf_value"], errors="coerce").dropna().tolist())
+    if latest_fmp is not None:
+        y_candidates.append(latest_fmp)
 
     if y_candidates:
         y_max = max(y_candidates)
@@ -583,9 +568,9 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
             headline_html = ""
             if consensus:
                 headline_html = (
-                    f'<div style="display:flex;align-items:baseline;gap:6px;margin-bottom:6px;">'
-                    f'<span style="color:#94a3b8;font-size:.72rem;white-space:nowrap;">目标价</span>'
-                    f'<span style="color:#e0e7ff;font-size:1.45rem;font-weight:800;'
+                    f'<div style="display:flex;align-items:baseline;gap:8px;margin-bottom:6px;">'
+                    f'<span style="color:#94a3b8;font-size:.85rem;white-space:nowrap;">目标价</span>'
+                    f'<span style="color:#e0e7ff;font-size:1.6rem;font-weight:800;'
                     f'letter-spacing:-.5px;font-family:\'Cascadia Mono\',monospace;">'
                     f'{currency_sym}{consensus:,.2f}</span>'
                     f'{up_badge}'
@@ -601,6 +586,15 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
                 con_pct = _pct(consensus) if consensus else None
                 med_pct = _pct(median) if median else None
 
+                # Decide vertical offsets so 现价 / 共识 labels do not collide horizontally.
+                # Both labels live above the bar; if their x-positions are close, stagger.
+                cur_label_top = -34
+                con_label_top = -34
+                if cur_pct is not None and con_pct is not None and abs(cur_pct - con_pct) < 22:
+                    # Put 共识 higher, 现价 lower so they do not overlap.
+                    con_label_top = -34
+                    cur_label_top = -20
+
                 markers_html = ""
                 if cur_pct is not None:
                     markers_html += (
@@ -609,8 +603,8 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
                         f'<div style="width:2px;height:14px;background:#00d4ff;'
                         f'border-radius:1px;box-shadow:0 0 5px #00d4ff88;"></div></div>'
                         f'<div style="position:absolute;left:{cur_pct:.1f}%;'
-                        f'transform:translateX(-50%);top:13px;'
-                        f'color:#00d4ff;font-size:.62rem;white-space:nowrap;">现价</div>'
+                        f'transform:translateX(-50%);top:{cur_label_top}px;'
+                        f'color:#00d4ff;font-size:.74rem;font-weight:700;white-space:nowrap;">现价</div>'
                     )
                 if con_pct is not None:
                     markers_html += (
@@ -619,15 +613,18 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
                         f'<div style="width:2px;height:14px;background:{up_clr};'
                         f'border-radius:1px;box-shadow:0 0 5px {up_clr}88;"></div></div>'
                         f'<div style="position:absolute;left:{con_pct:.1f}%;'
-                        f'transform:translateX(-50%);top:13px;'
-                        f'color:{up_clr};font-size:.62rem;white-space:nowrap;">共识</div>'
+                        f'transform:translateX(-50%);top:{con_label_top}px;'
+                        f'color:{up_clr};font-size:.74rem;font-weight:700;white-space:nowrap;">共识</div>'
                     )
                 if med_pct is not None:
                     markers_html += (
                         f'<div style="position:absolute;left:{med_pct:.1f}%;'
-                        f'transform:translateX(-50%);top:-1px;">'
-                        f'<div style="width:6px;height:6px;background:#f59e0b;'
+                        f'transform:translateX(-50%);top:1px;">'
+                        f'<div style="width:8px;height:8px;background:#f59e0b;'
                         f'border-radius:50%;box-shadow:0 0 4px #f59e0b88;"></div></div>'
+                        f'<div style="position:absolute;left:{med_pct:.1f}%;'
+                        f'transform:translateX(-50%);top:14px;'
+                        f'color:#f59e0b;font-size:.7rem;font-weight:600;white-space:nowrap;">中位</div>'
                     )
 
                 fill_html = (
@@ -644,15 +641,15 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
                     )
 
                 range_bar_html = (
-                    f'<div style="margin:14px 4px 26px;">'
+                    f'<div style="margin:42px 4px 34px;">'
                     f'<div style="position:relative;height:8px;background:#1e3a5f;'
                     f'border-radius:4px;overflow:visible;">'
                     f'{fill_html}{markers_html}'
                     f'</div>'
-                    f'<div style="display:flex;justify-content:space-between;margin-top:4px;">'
-                    f'<span style="color:#64748b;font-size:.65rem;">{currency_sym}{low:,.0f}</span>'
-                    f'<span style="color:#64748b;font-size:.65rem;font-style:italic;">目标价区间</span>'
-                    f'<span style="color:#64748b;font-size:.65rem;">{currency_sym}{high:,.0f}</span>'
+                    f'<div style="display:flex;justify-content:space-between;margin-top:8px;">'
+                    f'<span style="color:#64748b;font-size:.74rem;">{currency_sym}{low:,.0f}</span>'
+                    f'<span style="color:#64748b;font-size:.74rem;font-style:italic;">目标价区间</span>'
+                    f'<span style="color:#64748b;font-size:.74rem;">{currency_sym}{high:,.0f}</span>'
                     f'</div></div>'
                 )
 
@@ -661,8 +658,8 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
                 if v:
                     hml_cells += (
                         f'<div style="text-align:center;flex:1;">'
-                        f'<div style="color:#64748b;font-size:.68rem;margin-bottom:2px;">{lbl}</div>'
-                        f'<div style="color:#e0e7ff;font-size:.82rem;font-weight:700;'
+                        f'<div style="color:#64748b;font-size:.78rem;margin-bottom:2px;">{lbl}</div>'
+                        f'<div style="color:#e0e7ff;font-size:.95rem;font-weight:700;'
                         f'border-bottom:2px solid {clr};padding-bottom:2px;">'
                         f'{currency_sym}{v:,.2f}</div></div>'
                     )
@@ -690,11 +687,11 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
                         if delta is not None:
                             d_clr = "#22c55e" if delta >= 0 else "#ef4444"
                             d_sign = "+" if delta >= 0 else ""
-                            d_html = f'<div style="color:{d_clr};font-size:.63rem;">{d_sign}{delta:.1f}%</div>'
+                            d_html = f'<div style="color:{d_clr};font-size:.74rem;">{d_sign}{delta:.1f}%</div>'
                         hist_cells += (
                             f'<div style="text-align:center;flex:1;">'
-                            f'<div style="color:#475569;font-size:.66rem;">{label} <span style="color:#334155">({n}家)</span></div>'
-                            f'<div style="color:#94a3b8;font-size:.78rem;font-weight:600;">{currency_sym}{avg:,.2f}</div>'
+                            f'<div style="color:#475569;font-size:.76rem;">{label} <span style="color:#334155">({n}家)</span></div>'
+                            f'<div style="color:#94a3b8;font-size:.9rem;font-weight:600;">{currency_sym}{avg:,.2f}</div>'
                             f'{d_html}'
                             f'</div>'
                         )
@@ -713,7 +710,7 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
                 f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">'
                 f'<span style="display:inline-block;width:3px;height:14px;'
                 f'background:linear-gradient(180deg,#00d4ff,#3b82f6);border-radius:2px;"></span>'
-                f'<span style="color:#94a3b8;font-size:.72rem;font-weight:600;'
+                f'<span style="color:#94a3b8;font-size:.85rem;font-weight:700;'
                 f'letter-spacing:.05em;">分析师共识</span>'
                 f'</div>'
                 f'{headline_html}'
@@ -764,22 +761,26 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
             if not gc:
                 header_html = (
                     f'<div style="margin:6px 0 4px;">'
-                    f'<span style="color:#94a3b8;font-size:.74rem;">'
+                    f'<span style="color:#94a3b8;font-size:.85rem;">'
                     f'{period_label}（买入 {buys} / 持有 {holds} / 卖出 {sells}）'
                     f'</span></div>'
                 )
+            # 持有 sits at the buy/hold boundary (= b_pct%); clamp away from edges
+            # so the label has room to render.
+            hold_left = max(6.0, min(94.0, b_pct))
             mix_bar_html = (
                 header_html
-                + f'<div style="display:flex;height:9px;border-radius:5px;'
+                + f'<div style="display:flex;height:11px;border-radius:5px;'
                 f'overflow:hidden;margin-bottom:5px;">'
-                f'<div style="width:{b_pct:.0f}%;background:#22c55e;"></div>'
-                f'<div style="width:{h_pct:.0f}%;background:#f59e0b;"></div>'
-                f'<div style="width:{s_pct:.0f}%;background:#ef4444;"></div>'
+                f'<div style="width:{b_pct:.1f}%;background:#22c55e;"></div>'
+                f'<div style="width:{h_pct:.1f}%;background:#f59e0b;"></div>'
+                f'<div style="width:{s_pct:.1f}%;background:#ef4444;"></div>'
                 f'</div>'
-                f'<div style="display:flex;justify-content:space-between;font-size:.74rem;margin-bottom:6px;">'
-                f'<span style="color:#22c55e;">买入 {b_pct:.0f}%</span>'
-                f'<span style="color:#f59e0b;">持有 {h_pct:.0f}%</span>'
-                f'<span style="color:#ef4444;">卖出 {s_pct:.0f}%</span>'
+                f'<div style="position:relative;height:1.3rem;font-size:.85rem;font-weight:600;margin-bottom:8px;">'
+                f'<span style="position:absolute;left:0;color:#22c55e;">买入 {b_pct:.0f}%</span>'
+                f'<span style="position:absolute;left:{hold_left:.1f}%;transform:translateX(-50%);'
+                f'color:#f59e0b;">持有 {h_pct:.0f}%</span>'
+                f'<span style="position:absolute;right:0;color:#ef4444;">卖出 {s_pct:.0f}%</span>'
                 f'</div>'
             )
             st.markdown(
@@ -795,11 +796,11 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
                     st.markdown(
                         f'<div style="display:flex;justify-content:space-between;align-items:center;'
                         f'gap:8px;margin:0 0 8px;">'
-                        f'<span style="color:#94a3b8;font-size:.74rem;">'
+                        f'<span style="color:#94a3b8;font-size:.82rem;">'
                         f'{period_label}（买入 {buys} / 持有 {holds} / 卖出 {sells}）</span>'
                         f'<span style="background:#1a2035;border:1px solid #1e3a5f;'
                         f'border-radius:6px;padding:2px 10px;color:{cl_color};'
-                        f'font-size:.8rem;font-weight:700;white-space:nowrap;">'
+                        f'font-size:.9rem;font-weight:700;white-space:nowrap;">'
                         f'共识: {consensus_label}</span></div>',
                         unsafe_allow_html=True,
                     )
@@ -945,13 +946,19 @@ def _render_price_alert_panel_d1(ticker: str, dcf_metrics: dict | None) -> None:
         st.warning(f"价格提醒功能暂不可用: {str(e)[:50]}")
 
 
-def _render_metrics_panel(ticker: str, df_ohlcv: pd.DataFrame, df_fund: pd.DataFrame) -> None:
-    """Render right-side compact metrics without oversized cards."""
-    with st.container():
-        # Fetch supporting data
-        company = get_company(ticker)
-        fmp_dcf_hist = get_fmp_dcf_history(ticker)
+def _render_metrics_panel(
+    ticker: str,
+    df_ohlcv: pd.DataFrame,
+    df_fund: pd.DataFrame,
+    df_fmp_dcf: pd.DataFrame,
+    company: dict | None,
+) -> None:
+    """Render right-side compact metrics without oversized cards.
 
+    `df_fmp_dcf` and `company` are passed in by the caller (already fetched on
+    the shared readonly conn) to keep the panel free of DB I/O.
+    """
+    with st.container():
         # Latest price
         latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
         latest_price_text = f"${latest_price:,.2f}" if latest_price else "—"
@@ -989,8 +996,8 @@ def _render_metrics_panel(ticker: str, df_ohlcv: pd.DataFrame, df_fund: pd.DataF
             avg_fcf_text = "—"
 
         # FMP DCF latest
-        if not fmp_dcf_hist.empty:
-            fmp_latest = fmp_dcf_hist.iloc[-1]
+        if df_fmp_dcf is not None and not df_fmp_dcf.empty:
+            fmp_latest = df_fmp_dcf.iloc[-1]
             fmp_dcf_val = float(fmp_latest.get("dcf_value", 0))
             fmp_dcf_text = f"${fmp_dcf_val:,.2f}" if fmp_dcf_val > 0 else "—"
         else:
@@ -1008,9 +1015,9 @@ def _render_metrics_panel(ticker: str, df_ohlcv: pd.DataFrame, df_fund: pd.DataF
         st.markdown(metrics_html, unsafe_allow_html=True)
 
 
-def render_d1_us() -> None:
+def render_d1_us() -> str:
     st.subheader("D1: 价格图线")
-    ticker_df = get_all_tickers(market="US")
+    ticker_df = get_all_tickers_cached(market="US")
     ticker_options = sorted(ticker_df["ticker"].dropna().astype(str).unique().tolist()) if not ticker_df.empty else []
     default_ticker = st.session_state.get("d1_us_ticker", "NVDA").strip().upper()
     if default_ticker and default_ticker not in ticker_options:
@@ -1022,22 +1029,21 @@ def render_d1_us() -> None:
     col_left, col_right = st.columns([7, 3], gap="medium")
 
     with col_right:
-        # Same row: ticker + start_date + refresh
-        c_tk, c_dt, c_rf = st.columns([1.4, 1.1, 0.7], gap="small")
+        # Same row: ticker + start_date + refresh, vertically centered
+        c_tk, c_dt, c_rf = st.columns([1.4, 1.1, 0.7], gap="small", vertical_alignment="center")
         with c_tk:
             ticker = st.selectbox(
-            "Ticker",
-            options=ticker_options,
-            index=ticker_options.index(default_ticker) if default_ticker in ticker_options else 0,
-            key="d1_us_ticker_select",
-            help="输入字符可搜索股票代码",
-            label_visibility="collapsed",
+                "Ticker",
+                options=ticker_options,
+                index=ticker_options.index(default_ticker) if default_ticker in ticker_options else 0,
+                key="d1_us_ticker_select",
+                help="输入字符可搜索股票代码",
+                label_visibility="collapsed",
             )
         st.session_state["d1_us_ticker"] = ticker
         with c_dt:
-            start_date = st.date_input("起始日期", value=pd.Timestamp("2018-01-01"), key="d1_us_start", label_visibility="collapsed")
+            start_date = st.date_input("起始日期", value=pd.Timestamp("2000-01-01"), key="d1_us_start", label_visibility="collapsed")
         with c_rf:
-            st.markdown('<div style="margin-top:-8px"></div>', unsafe_allow_html=True)
             do_refresh = st.button("刷新", key=f"refresh_top_{ticker}", type="secondary", width="stretch")
 
     if do_refresh:
@@ -1048,18 +1054,24 @@ def render_d1_us() -> None:
         else:
             st.error(msg)
 
-    df_ohlcv = get_ohlcv(ticker, start_date=str(start_date))
-    if df_ohlcv.empty:
-        with col_left:
-            st.info("本地数据库暂无该 ticker 的行情数据。请先在命令行完成 ETL。")
-        return
+    # Single readonly connection for every repository read in this render —
+    # avoids ~6 separate `duckdb.connect` calls per page rerun.
+    with get_conn(readonly=True) as conn:
+        df_ohlcv = get_ohlcv(ticker, start_date=str(start_date), conn=conn)
+        if df_ohlcv.empty:
+            with col_left:
+                st.info("本地数据库暂无该 ticker 的行情数据。请先在命令行完成 ETL。")
+            return ticker
 
-    df_ohlcv = _ensure_ema_columns(df_ohlcv)
-    df_fund = get_fundamentals(ticker)
-    df_dcf_hist = get_dcf_history(ticker)
-    if df_dcf_hist.empty:
-        df_dcf_hist = _build_dcf_history_fallback(df_fund, df_ohlcv, ticker)
-    df_fmp_dcf = get_fmp_dcf_history(ticker)
+        df_ohlcv = _ensure_ema_columns(df_ohlcv)
+        df_fund = get_fundamentals(ticker, conn=conn)
+        df_dcf_hist = get_dcf_history(ticker, conn=conn)
+        if df_dcf_hist.empty:
+            df_dcf_hist = _build_dcf_history_fallback(df_fund, df_ohlcv, ticker)
+        df_fmp_dcf = get_fmp_dcf_history(ticker, conn=conn)
+        company = get_company(ticker, conn=conn)
+        dcf_metrics = get_dcf_metrics(ticker, conn=conn)
+
     fig = _build_chart(df_ohlcv, df_dcf_hist, df_fmp_dcf, ticker=ticker)
 
     with col_left:
@@ -1067,8 +1079,9 @@ def render_d1_us() -> None:
         _render_notes_panel_d1(ticker)
 
     with col_right:
-        _render_metrics_panel(ticker, df_ohlcv, df_fund)
+        _render_metrics_panel(ticker, df_ohlcv, df_fund, df_fmp_dcf, company)
         latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
         _render_analyst_panel_d1(ticker, latest_price)
-        dcf_metrics = get_dcf_metrics(ticker)
         _render_price_alert_panel_d1(ticker, dcf_metrics)
+
+    return ticker

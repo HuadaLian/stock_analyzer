@@ -4,13 +4,17 @@
 
 ---
 
-## 阶段性总结（截至 2026-04-25）
+## 阶段性总结（截至 2026-04-26）
 
-- 已完成新版 D1 主图看板：日 K、EMA10/250、14x/24x/34x DCF 阶梯线、FMP DCF 参照线。
+- 已完成新版 D1 主图看板：日 K、EMA10/250、14x/24x/34x DCF 阶梯线、FMP DCF 单条最新值横线。
 - 已完成新版 D1 右侧信息区：核心指标、分析师共识、最近评级动作、价格提醒。
 - 已接入 D1 投研笔记：原始笔记追加写入 + LLM 结构化 Markdown 回写数据库。
+- **D2**（`dashboards/d2_business.py`）：公司简介、收入按业务/地区、EBITDA 覆盖度、管理层链接等只读展示。
+- **D3**（`dashboards/d3_industry.py`）：同行业最新总收入 CCDF 分布（USD 口径）、同业列表含「货币」列。
+- 年报入库：`fundamentals_annual` 含 `reporting_currency` / `fx_to_usd`，收入等金额在 ETL 中归一为 USD（百万）存储。
 - 已确认数据库分层：原始层、派生层、用户层、回测层均有建表与文档说明。
 - 旧版三市场分析入口继续保留，作为迁移期稳定基线。
+- **自动化测试**：`python -m pytest tests -q`（含 D1 图线结构、D3 换算与 Plotly 轴、`get_industry_peers_revenue` 等）。
 
 ---
 
@@ -37,7 +41,10 @@
 
 ### 4) ETL 与数据库
 
-- ETL 入口：etl_run.py（--tickers 必填，--init 可选）。
+- **单票 / 少量**：`python etl_run.py --tickers NVDA ...`（可选 `--skip-optional`、`--init`）。
+- **美股全量（SEC 主列表 + CIK 去重 + 非普通股过滤）**：`python -m etl.us_bulk_run --init-db` 后 `python -m etl.us_bulk_run --rate-limit-ms 400 --skip-optional`；进度表 `etl_us_bulk_state`；日志 `logs/us_bulk_*.log`。`--retry-failed` 只重跑失败；`--force` 重跑含已 done。FMP `isEtf`/`isFund` 的标的会记为 `skipped` 不入主流程。
+- **每小时自检（本机）**：`python -m etl.us_bulk_watch` → 追加 `reports/us_etl_watch.log`。Windows 任务计划程序示例：`schtasks /Create /TN StockUSWatch /SC HOURLY /TR "conda run -n stock_analyzer python -m etl.us_bulk_watch" /F`（请把 `conda` 与项目路径改成你的环境）。
+- **入库后审计**：`python -m db.us_data_audit` → 生成 `reports/us_etl_audit_*.md`（货币与覆盖率摘要）。
 - 核心数据源：FMP（profile / ohlcv / annual fcf / dcf history）。
 - 主数据库：stock.db（DuckDB 单文件）。
 
@@ -49,7 +56,7 @@
 
 ```bash
 conda activate stock_analyzer
-pip install streamlit duckdb yfinance akshare plotly pandas numpy requests beautifulsoup4 google-genai futu-api
+pip install streamlit duckdb yfinance akshare plotly pandas numpy requests beautifulsoup4 google-genai futu-api pytest
 ```
 
 ### 2) 配置 .env（项目根目录）
@@ -68,6 +75,9 @@ python etl_run.py --init --tickers NVDA
 
 # 增量更新多只股票
 python etl_run.py --tickers NVDA AAPL MSFT
+
+# 更快：跳过管理层 / 分部收入 / 地区收入 / 利息费用
+python etl_run.py --tickers NVDA --skip-optional
 ```
 
 ### 4) 启动应用
@@ -77,6 +87,12 @@ streamlit run app.py
 ```
 
 访问 http://localhost:8501
+
+### 5) 运行单元测试
+
+```bash
+python -m pytest tests -q
+```
 
 ---
 
@@ -91,19 +107,27 @@ stock_analyzer/
 │   ├── cn.py
 │   └── hk.py
 ├── dashboards/
-│   └── d1_fcf_multiple.py
+│   ├── d1_fcf_multiple.py
+│   ├── d2_business.py
+│   └── d3_industry.py
 ├── db/
 │   ├── schema.py
 │   ├── repository.py
 │   ├── checks.py
+│   ├── us_data_audit.py
 │   └── README.md
 ├── etl/
 │   ├── compute.py
 │   ├── loader.py
+│   ├── pipeline.py
+│   ├── us_bulk_run.py
+│   ├── us_bulk_watch.py
 │   └── sources/
 │       ├── fmp.py
 │       └── fmp_dcf.py
 ├── etl_run.py
+├── logs/
+├── reports/
 ├── data_provider.py
 ├── gemini_chat.py
 ├── downloader.py
@@ -113,6 +137,10 @@ stock_analyzer/
 ├── background_worker.py
 ├── stock.db
 └── tests/
+    ├── dashboards/       # D1/D3 Plotly 与换算逻辑
+    ├── db/
+    ├── etl_compute/
+    └── etl_fmp/
 ```
 
 ---
@@ -130,13 +158,8 @@ stock_analyzer/
 
 ### 进行中
 
-- [ ] 新版 D2（位于笔记输入下方）：
-  - 收入来源饼图
-  - 行业 / 板块名称
-  - 类 ROIC.ai 的 business 描述
-  - 管理层信息（从原 D3 需求并入）
-- [ ] 新版 D3（类 Value Line 板块比较）：
-  - 仅用总收入做板块内相对水平排名
+- [x] 新版 D2（笔记下方）：业务描述、板块/行业、收入拆分饼图、EBITDA 覆盖、管理层（已实现，数据依赖 ETL 是否拉全）。
+- [x] 新版 D3：同板块同行业总收入 CCDF + 排名 + 货币列（已实现；精细视觉可在 Streamlit 中人工过目）。
 
 ### 原计划偏差（已作废或延期）
 
@@ -157,11 +180,12 @@ stock_analyzer/
 
 当前重点表：
 
-- companies：公司元数据
+- companies：公司元数据（含 `currency`，与日线报价货币一致，供 D3 等同业对比换算）
 - ohlcv_daily：日行情 + ema10/ema250 + market_cap
-- fundamentals_annual：年度基本面
-- dcf_history / dcf_metrics：D1 DCF 阶梯线与最新估值
+- fundamentals_annual：年度基本面（`currency` 为归一后 USD 百万口径；`reporting_currency` + `fx_to_usd` 保留原始报告货币与汇率审计）
+- dcf_history / dcf_metrics：D1 DCF 阶梯线与最新估值（`dcf_metrics` 含 latest_price、多空潜力等派生字段）
 - fmp_dcf_history：FMP DCF 日历史
+- revenue_by_segment / revenue_by_geography / management：D2 数据源
 - notes：raw_text + markdown
 - price_alerts：提醒记录（当前提醒流程仍以 OpenD 调用为主）
 

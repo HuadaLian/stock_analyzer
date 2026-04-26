@@ -49,7 +49,11 @@ def _parse_fmp_dcf_payload(ticker: str, payload: list | dict) -> list[dict]:
     return rows
 
 
-def fetch_fmp_dcf_history(ticker: str, api_key: str) -> list[dict]:
+def fetch_fmp_dcf_history(
+    ticker: str,
+    api_key: str,
+    date_from: str | None = None,
+) -> list[dict]:
     """Fetch and parse FMP historical DCF rows for one ticker.
     
     Tries endpoints in order:
@@ -62,7 +66,7 @@ def fetch_fmp_dcf_history(ticker: str, api_key: str) -> list[dict]:
     try:
         resp = requests.get(
             f"{_FMP_V3_BASE}/historical-discounted-cash-flow-statement/{ticker}",
-            params={"apikey": api_key},
+            params={"apikey": api_key, **({"from": date_from} if date_from else {})},
             timeout=30,
         )
         resp.raise_for_status()
@@ -76,7 +80,7 @@ def fetch_fmp_dcf_history(ticker: str, api_key: str) -> list[dict]:
     try:
         resp = requests.get(
             f"{_FMP_STABLE_BASE}/discounted-cash-flow",
-            params={"symbol": ticker, "apikey": api_key},
+            params={"symbol": ticker, "apikey": api_key, **({"from": date_from} if date_from else {})},
             timeout=30,
         )
         resp.raise_for_status()
@@ -98,7 +102,19 @@ def load_fmp_dcf_history(
 
     Returns number of fetched rows.
     """
+    last_date_row = conn.execute(
+        "SELECT MAX(date) FROM fmp_dcf_history WHERE ticker = ?",
+        [ticker.upper()],
+    ).fetchone()
+    date_from = str(last_date_row[0]) if last_date_row and last_date_row[0] is not None else None
+
     key = api_key or load_api_key()
-    rows = fetch_fn(ticker, key)
+    try:
+        rows = fetch_fn(ticker, key, date_from=date_from)
+    except TypeError:
+        # Backward compatibility for tests/mocks using old 2-arg signature.
+        rows = fetch_fn(ticker, key)
+    if date_from:
+        rows = [r for r in rows if str(r.get("date", "")) >= date_from]
     upsert_fmp_dcf_history(conn, rows)
     return len(rows)

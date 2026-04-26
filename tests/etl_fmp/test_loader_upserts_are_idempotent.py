@@ -20,7 +20,8 @@ from etl.loader import (
 def _company_row(name: str = "NVIDIA Corporation") -> dict:
     return {
         "ticker": "NVDA", "market": "US", "name": name,
-        "exchange": "NASDAQ", "sector": "Technology",
+        "exchange": "NASDAQ", "exchange_full_name": "NASDAQ Global Select",
+        "country": "US", "sector": "Technology",
         "industry": "Semiconductors", "currency": "USD",
         "description": "GPU maker", "shares_out": 24_500.0,
     }

@@ -6,17 +6,51 @@ Usage:
 
     conn = get_conn()                # read-write (ETL only)
     conn = get_conn(readonly=True)   # read-only (Streamlit UI)
+
+Read replica (Windows / concurrent bulk):
+    Set env ``STOCK_ANALYZER_READ_DB`` to a **copy** of ``stock.db`` (refresh the copy
+    when bulk is idle). All ``get_conn(readonly=True)`` calls then use that file so the
+    UI can run while ``us_bulk_run`` holds an exclusive lock on the primary file.
+    Writes (``get_conn()``) always use the primary ``stock.db``.
 """
 
+from __future__ import annotations
+
+import os
 import duckdb
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent.parent / "stock.db"
+READ_DB_ENV = "STOCK_ANALYZER_READ_DB"
+
+_LOCK_HINT = (
+    " If another process holds stock.db (e.g. `python -m etl.us_bulk_run`), on Windows "
+    "DuckDB often cannot open a second connection. Copy stock.db to a second path when "
+    "bulk is stopped, set env STOCK_ANALYZER_READ_DB to that path, then start Streamlit."
+)
 
 
 def get_conn(readonly: bool = False) -> duckdb.DuckDBPyConnection:
-    """Return a DuckDB connection to stock.db."""
-    return duckdb.connect(str(DB_PATH), read_only=readonly)
+    """Return a DuckDB connection to ``stock.db`` (write) or a read-only path."""
+    if readonly:
+        mirror = os.environ.get(READ_DB_ENV, "").strip()
+        if mirror:
+            p = Path(mirror).expanduser()
+            if not p.is_file():
+                raise FileNotFoundError(
+                    f"{READ_DB_ENV}={mirror!r} is not an existing file. "
+                    f"Copy {DB_PATH} to that path when the writer is not using the DB, "
+                    "then point Streamlit at the copy."
+                )
+            return duckdb.connect(str(p.resolve()), read_only=True)
+        try:
+            return duckdb.connect(str(DB_PATH), read_only=True)
+        except Exception as e:
+            msg = str(e)
+            if "Cannot open file" in msg or "另一个程序正在使用" in msg:
+                raise RuntimeError(msg + _LOCK_HINT) from e
+            raise
+    return duckdb.connect(str(DB_PATH), read_only=False)
 
 
 _DDL = """
@@ -25,16 +59,18 @@ _DDL = """
 -- Company universe
 -- ═══════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS companies (
-    ticker          VARCHAR PRIMARY KEY,
-    market          VARCHAR,        -- 'US' | 'CN' | 'HK'
-    name            VARCHAR,
-    exchange        VARCHAR,        -- e.g. 'NASDAQ', 'NYSE'
-    sector          VARCHAR,
-    industry        VARCHAR,
-    currency        VARCHAR,        -- reporting currency, e.g. 'USD'
-    description     TEXT,
-    shares_out      DOUBLE,         -- latest shares outstanding (millions)
-    updated_at      TIMESTAMP
+    ticker              VARCHAR PRIMARY KEY,
+    market              VARCHAR,        -- 'US' | 'CN' | 'HK'
+    name                VARCHAR,
+    exchange            VARCHAR,        -- short, e.g. 'NASDAQ', 'NYSE'
+    exchange_full_name  VARCHAR,        -- e.g. 'NASDAQ Global Select'
+    country             VARCHAR,        -- issuer / listing country
+    sector              VARCHAR,
+    industry            VARCHAR,
+    currency            VARCHAR,        -- reporting currency, e.g. 'USD'
+    description         TEXT,
+    shares_out          DOUBLE,         -- latest shares outstanding (millions)
+    updated_at          TIMESTAMP
 );
 
 -- ═══════════════════════════════════════════════
@@ -294,12 +330,24 @@ _MIGRATIONS = [
     # Idempotent ALTERs — added when columns are introduced after the initial DDL.
     "ALTER TABLE fundamentals_annual ADD COLUMN IF NOT EXISTS reporting_currency VARCHAR",
     "ALTER TABLE fundamentals_annual ADD COLUMN IF NOT EXISTS fx_to_usd DOUBLE",
+    "ALTER TABLE fundamentals_annual ADD COLUMN IF NOT EXISTS interest_expense DOUBLE",
     "ALTER TABLE dcf_metrics ADD COLUMN IF NOT EXISTS latest_price DOUBLE",
     "ALTER TABLE dcf_metrics ADD COLUMN IF NOT EXISTS latest_price_date DATE",
     "ALTER TABLE dcf_metrics ADD COLUMN IF NOT EXISTS short_potential DOUBLE",
     "ALTER TABLE dcf_metrics ADD COLUMN IF NOT EXISTS invest_potential DOUBLE",
     "ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS ema10 DOUBLE",
     "ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS ema250 DOUBLE",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS country VARCHAR",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS exchange_full_name VARCHAR",
+    """
+    CREATE TABLE IF NOT EXISTS etl_us_bulk_state (
+        ticker      VARCHAR PRIMARY KEY,
+        status      VARCHAR,        -- pending | running | done | failed | skipped
+        step        VARCHAR,
+        last_error  VARCHAR,
+        updated_at  TIMESTAMP DEFAULT now()
+    )
+    """,
 ]
 
 
