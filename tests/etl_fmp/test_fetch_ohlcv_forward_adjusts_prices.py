@@ -65,10 +65,22 @@ def test_fetch_ohlcv_market_cap_is_none_when_shares_unknown(mock_fmp):
 
 
 def test_fetch_ohlcv_raises_when_no_history_returned(mock_fmp):
-    """FMP 返回空数组时必须报错，否则会写 0 行还显示成功。"""
+    """FMP 返回空数组且是宽窗口 / 无日期过滤时必须报错，否则会写 0 行还显示成功。"""
     mock_fmp.set("historical-price-eod/full", [])
     with pytest.raises(ValueError, match="no price history"):
         fetch_ohlcv("FAKE", shares_out_raw=1_000_000)
+
+
+def test_fetch_ohlcv_empty_returns_list_for_narrow_incremental_window(mock_fmp):
+    """增量只拉最近几天时 FMP 常返回 []（尚无新 K 线），应视为 0 根新 bar 而非整票失败。"""
+    mock_fmp.set("historical-price-eod/full", [])
+    rows = fetch_ohlcv(
+        "NVDA",
+        shares_out_raw=1_000_000,
+        date_from="2026-04-20",
+        date_to="2026-04-26",
+    )
+    assert rows == []
 
 
 def test_fetch_ohlcv_accepts_date_window_and_passes_to_source(mock_fmp):

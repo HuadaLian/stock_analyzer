@@ -1,5 +1,7 @@
 """
-Post–US-bulk audit: currency sanity + coverage. Writes Markdown report.
+US market–level audit (currency, coverage, ETL state). Writes Markdown.
+
+Dimension definitions live in ``db.data_quality_spec`` (US slices + ETL).
 
 Usage:
     python -m db.us_data_audit
@@ -118,9 +120,9 @@ def run_audit(out_path: Path | None) -> tuple[str, Path]:
         cur = conn.execute(
             """
             SELECT
-              SUM(CASE WHEN currency IS NULL OR currency != 'USD' THEN 1 ELSE 0 END),
-              SUM(CASE WHEN reporting_currency IS NULL THEN 1 ELSE 0 END),
-              SUM(CASE WHEN fx_to_usd IS NULL THEN 1 ELSE 0 END),
+              SUM(CASE WHEN f.currency IS NULL OR f.currency != 'USD' THEN 1 ELSE 0 END),
+              SUM(CASE WHEN f.reporting_currency IS NULL THEN 1 ELSE 0 END),
+              SUM(CASE WHEN f.fx_to_usd IS NULL THEN 1 ELSE 0 END),
               COUNT(*)
             FROM fundamentals_annual f
             JOIN companies c ON c.ticker = f.ticker AND c.market = 'US'

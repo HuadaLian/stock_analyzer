@@ -1,4 +1,4 @@
-"""Database completeness checks for D1/data-readiness.
+"""Per-ticker completeness / D1 readiness (see ``db.data_quality_spec``).
 
 Usage:
     python -m db.checks --ticker NVDA
@@ -193,10 +193,6 @@ def list_distinct_data_tickers(conn) -> list[str]:
         """
     ).fetchall()
     return [str(r[0]) for r in rows]
-
-
-def _list_distinct_tickers(conn) -> list[str]:
-    return list_distinct_data_tickers(conn)
 
 
 def main() -> None:

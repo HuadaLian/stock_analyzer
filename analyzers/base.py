@@ -1126,7 +1126,7 @@ class MarketAnalyzer:
         key = self.market.lower()
         ticker_raw = st.text_input(
             self.ticker_input_label,
-            value=self.ticker_input_default,
+            value=st.session_state.get(f"{key}_ticker", self.ticker_input_default),
             key=f"{key}_ticker",
         )
 

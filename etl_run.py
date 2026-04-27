@@ -8,12 +8,17 @@ Usage:
 
 import argparse
 import sys
+from pathlib import Path
 
 from db.schema import get_conn, init_db
+from etl.dotenv_local import merge_dotenv_into_environ
 from etl.pipeline import USRunOptions, run_us_ticker
+
+_REPO_ROOT = Path(__file__).resolve().parent
 
 
 def main():
+    merge_dotenv_into_environ(_REPO_ROOT)
     parser = argparse.ArgumentParser(description="Stock Analyzer ETL")
     parser.add_argument("--tickers", nargs="+", required=True,
                         help="Ticker symbols to fetch, e.g. NVDA AAPL")
@@ -24,13 +29,23 @@ def main():
         action="store_true",
         help="Skip management, segment/geo revenue, interest expense (faster)",
     )
+    parser.add_argument(
+        "--refresh-mode",
+        choices=("full", "ohlcv", "fundamentals", "fmp_dcf"),
+        default="full",
+        help="Subset of FMP fetch+apply (same as python -m etl.us_bulk_run --refresh-mode).",
+    )
     args = parser.parse_args()
 
     if args.init:
         print("Initialising database schema...")
         init_db()
 
-    opts = USRunOptions(skip_optional=args.skip_optional, verbose=True)
+    opts = USRunOptions(
+        skip_optional=args.skip_optional,
+        verbose=True,
+        refresh_mode=str(args.refresh_mode),
+    )
     failed = []
     with get_conn() as conn:
         for ticker in args.tickers:

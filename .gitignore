@@ -292,7 +292,6 @@ stock.db
 /reports/*
 /reports/db_quality_cache/audit_subprocess.log
 /reports/__init__.py
-/reports/_db_report_once.py
 /reports/.gitkeep
 /reports/run_db_quality_audit.py
 /reports/us_etl_watch.log

@@ -52,6 +52,22 @@ def _get(endpoint: str, **params) -> list | dict:
     return data
 
 
+def search_symbols(query: str, limit: int = 500) -> list[dict]:
+    """Search active symbols in FMP stable API.
+
+    FMP legacy universe endpoints (available-traded/list, stock/list) are
+    deprecated for non-legacy plans. ``stable/search-symbol`` is available and
+    returns active symbols for a query prefix.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    data = _get("search-symbol", query=q, limit=int(limit))
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # fetch_profile  →  companies table
 # ---------------------------------------------------------------------------
@@ -116,7 +132,7 @@ def fetch_profile(ticker: str) -> dict:
 
     return {
         "ticker":      ticker.upper(),
-        "market":      "US",
+        "market":      "GLOBAL",
         "name":        p.get("companyName") or p.get("name"),
         "exchange":    ex_short,
         "exchange_full_name": ex_full,
@@ -162,6 +178,26 @@ def fetch_ohlcv(
     data = _get("historical-price-eod/full", **params)
     historical = data if isinstance(data, list) else data.get("historical", [])
     if not historical:
+        # Incremental OHLCV: requesting only the last few calendar days often yields
+        # [] when no new daily bar exists yet (same-day, weekend, holiday). A full
+        # backfill with a wide [from, to] should still error so bad keys / dead
+        # symbols are not silently "success".
+        if date_from and date_to:
+            try:
+                d0 = date.fromisoformat(str(date_from)[:10])
+                d1 = date.fromisoformat(str(date_to)[:10])
+                span_days = (d1 - d0).days
+                if 0 <= span_days <= 7:
+                    _log.warning(
+                        "FMP empty OHLCV for %s (from=%s to=%s, span=%d d) — no new bars; continuing",
+                        ticker,
+                        date_from,
+                        date_to,
+                        span_days,
+                    )
+                    return []
+            except ValueError:
+                pass
         raise ValueError(f"FMP returned no price history for {ticker}")
 
     rows = []

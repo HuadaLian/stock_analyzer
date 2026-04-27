@@ -161,11 +161,16 @@ def compute_ema_series(values: pd.Series, span: int) -> pd.Series:
 
 
 def compute_ema(ticker: str, conn: duckdb.DuckDBPyConnection) -> int:
-    """Compute ema10 / ema250 over ticker's full ohlcv_daily history and
-    write back into the same rows. Returns row count written.
+    """Compute ema10 / ema250 over ticker's **full** ``ohlcv_daily`` history and
+    upsert **every** row's EMA columns (not only the newly fetched bars).
 
-    Computed eagerly over all rows (not incrementally) so a backfill or a
-    re-run gives identical numbers — EMA depends on the full prior series."""
+    Wall time scales with total bar count for this ticker: each apply re-reads
+    the whole series and re-writes all EMA cells so numbers match a full
+    pandas ``ewm`` pass (simple semantics; incremental tail-only updates are
+    possible later for speed).
+
+    Returns row count written.
+    """
     df = conn.execute("""
         SELECT date, adj_close
         FROM ohlcv_daily
@@ -178,9 +183,13 @@ def compute_ema(ticker: str, conn: duckdb.DuckDBPyConnection) -> int:
     df["ema10"] = compute_ema_series(df["adj_close"], span=10)
     df["ema250"] = compute_ema_series(df["adj_close"], span=250)
 
-    rows = [{"ticker": ticker, "date": r["date"],
-             "ema10": float(r["ema10"]), "ema250": float(r["ema250"])}
-            for _, r in df.iterrows()]
+    dates = df["date"].to_list()
+    e10 = df["ema10"].to_numpy(dtype="float64", copy=False)
+    e250 = df["ema250"].to_numpy(dtype="float64", copy=False)
+    rows = [
+        {"ticker": ticker, "date": dates[i], "ema10": float(e10[i]), "ema250": float(e250[i])}
+        for i in range(len(dates))
+    ]
     upsert_ohlcv_ema(conn, rows)
     return len(rows)
 

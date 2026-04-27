@@ -3,6 +3,10 @@ import streamlit as st
 import pandas as pd
 import os
 import time
+from pathlib import Path
+from db.schema import get_conn, DB_PATH, READ_DB_ENV
+from etl.pipeline import USRunOptions, run_us_ticker
+from etl.snapshot import snapshot_db
 
 # Auto-detect read replica BEFORE anything else can call get_conn(readonly=True).
 # If STOCK_ANALYZER_READ_DB is unset and stock_read.db exists next to stock.db,
@@ -10,14 +14,17 @@ import time
 # keep running concurrently). User-set env vars are preserved.
 from dashboards.db_status import bootstrap_read_replica, render_status_caption
 from dashboards.db_quality import render_db_quality_tab
+from dashboards.symbol_registry import search_registry_options
+from dashboards.factor_lab import render_factor_lab
 bootstrap_read_replica()
 
-from analyzers import USAnalyzer, CNAnalyzer, HKAnalyzer
-from dashboards.d1_fcf_multiple import render_d1_us
-from dashboards.d2_business import render_d2_us
-from dashboards.d3_industry import render_d3_us
+from analyzers import USAnalyzer
+from dashboards.d1_fcf_multiple import render_d1_stock
+from dashboards.d2_business import render_d2_stock
+from dashboards.d3_industry import render_d3_stock
 from chart_store import load_chart
 from analysis_tracker import get_analyzed_tickers
+from core.symbol_router import parse_global_symbol, apply_global_selection
 from gemini_chat import (
     MODELS, MODEL_RATE_LIMITS, DEFAULT_ENABLED_MODELS, RULES_PATH,
     _MODEL_CAPABILITY_RANK,
@@ -216,38 +223,144 @@ if "_sid" not in st.session_state:
     st.session_state["_sid"] = str(_uuid.uuid4())
 
 # ── Tabs ─────────────────────────────────────────────────────────────────
-tab_us, tab_cn, tab_hk, tab_reviewed, tab_db_quality, tab_settings = st.tabs([
-    "🇺🇸 美股分析中心", "🇨🇳 A股分析中心", "🇭🇰 港股分析中心",
-    "📋 已分析股票", "🧪 数据库质量检测", "⚙️ 设置",
+tab_stock, tab_reviewed, tab_db_quality, tab_settings = st.tabs([
+    "📈 个股分析中心",
+    "🧪 因子分析",
+    "🧪 数据库质量检测",
+    "⚙️ 设置",
 ])
 
+# Keep reviewed-page implementation in codebase, but disable in UI for now.
+ENABLE_REVIEWED_TAB = False
+
+
+def _needs_fmp_fill(ticker: str) -> bool:
+    """True when ticker is missing or only partially populated in DB."""
+    t = (ticker or "").strip().upper()
+    if not t:
+        return False
+    with get_conn(readonly=True) as conn:
+        c_row = conn.execute("SELECT COUNT(*) FROM companies WHERE ticker = ?", [t]).fetchone()
+        o_row = conn.execute("SELECT COUNT(*) FROM ohlcv_daily WHERE ticker = ?", [t]).fetchone()
+        f_row = conn.execute("SELECT COUNT(*) FROM fundamentals_annual WHERE ticker = ?", [t]).fetchone()
+    has_company = bool(c_row and int(c_row[0]) > 0)
+    ohlcv_n = int(o_row[0]) if o_row else 0
+    fund_n = int(f_row[0]) if f_row else 0
+    return (not has_company) or ohlcv_n == 0 or fund_n == 0
+
+
+def _fill_single_ticker_from_fmp(ticker: str) -> tuple[bool, str]:
+    t = (ticker or "").strip().upper()
+    if not t:
+        return False, "ticker 为空"
+    try:
+        with get_conn() as conn:
+            run_us_ticker(
+                conn,
+                t,
+                USRunOptions(skip_optional=True, verbose=False, refresh_mode="full"),
+            )
+        return True, f"已从 FMP 填充 {t}"
+    except Exception as e:
+        return False, f"FMP 填充失败: {e}"
+
+
+def _sync_read_replica_after_fill() -> tuple[bool, str]:
+    """Best-effort sync: stock.db -> read replica after single-ticker fill."""
+    mirror = os.environ.get(READ_DB_ENV, "").strip()
+    if mirror:
+        dst = Path(mirror).expanduser()
+    else:
+        dst = DB_PATH.parent / "stock_read.db"
+        if not dst.is_file():
+            return False, "未检测到 read 副本，已仅更新主库"
+    ok, _bytes, msg = snapshot_db(DB_PATH, dst)
+    if ok:
+        return True, f"read 副本已刷新（{dst.name}）"
+    return False, f"read 副本刷新失败：{msg}"
+
 # =====================================================================
-#  美股
+#  个股分析中心（D1 + D2 + D3）
 # =====================================================================
-with tab_us:
-    tab_us_legacy, tab_us_d1 = st.tabs(["旧版", "D1"])
-    with tab_us_legacy:
-        USAnalyzer().run()
-    with tab_us_d1:
-        ticker = render_d1_us()
+with tab_stock:
+    st.subheader("📈 个股分析中心")
+    st.caption("一个搜索框覆盖全球普通股（US/ADR/OTC、A股、港股）。")
+
+    # Streamlit: widget key must only be mutated before widget instantiation.
+    pending_query = st.session_state.pop("_global_symbol_query_pending", None)
+    if pending_query is not None:
+        st.session_state["global_symbol_query"] = pending_query
+
+    q_col, btn_col = st.columns([5, 1])
+    with q_col:
+        symbol_query = st.text_input(
+            "搜索代码",
+            value=st.session_state.get("global_symbol_query", ""),
+            placeholder="例如: AAPL / BABA / 600519 / 000001.SZ / 00700 / 0700.HK",
+            key="global_symbol_query",
+        )
+        options = search_registry_options(symbol_query, limit=80)
+        if options:
+            picked = st.selectbox(
+                "快速联想",
+                options=[""] + [o["label"] for o in options],
+                index=0,
+                key="global_symbol_pick",
+                help="可选：从候选列表直接选中",
+            )
+            if picked:
+                sel = next((o for o in options if o["label"] == picked), None)
+                last_picked = st.session_state.get("_global_symbol_last_pick_label", "")
+                if sel and picked != last_picked:
+                    st.session_state["_global_symbol_query_pending"] = sel["ticker"]
+                    apply_global_selection(st.session_state, sel["market"], sel["ticker"])
+                    st.session_state["_global_symbol_last_pick_label"] = picked
+                    st.rerun()
+            else:
+                st.session_state.pop("_global_symbol_last_pick_label", None)
+    with btn_col:
+        st.markdown("<div style='margin-top: 28px'></div>", unsafe_allow_html=True)
+        do_analyze_global = st.button("分析", key="global_analyze_btn", use_container_width=True)
+
+    if "global_selected_market" not in st.session_state:
+        st.session_state["global_selected_market"] = "US"
+    if "global_selected_ticker" not in st.session_state:
+        st.session_state["global_selected_ticker"] = "NVDA"
+    if "active_market" not in st.session_state:
+        st.session_state["active_market"] = st.session_state["global_selected_market"]
+    if "active_ticker" not in st.session_state:
+        st.session_state["active_ticker"] = st.session_state["global_selected_ticker"]
+
+    if do_analyze_global and symbol_query.strip():
+        mkt, tk = parse_global_symbol(symbol_query)
+        apply_global_selection(st.session_state, mkt, tk)
+        with st.spinner(f"正在检查并补全 {tk} 数据..."):
+            if _needs_fmp_fill(tk):
+                ok, msg = _fill_single_ticker_from_fmp(tk)
+                if ok:
+                    rep_ok, rep_msg = _sync_read_replica_after_fill()
+                    if rep_ok:
+                        st.success(f"{msg}；{rep_msg}")
+                    else:
+                        st.warning(f"{msg}；{rep_msg}")
+                else:
+                    st.warning(msg)
+
+    selected_market = st.session_state.get("global_selected_market", "US")
+    selected_ticker = st.session_state.get("global_selected_ticker", "NVDA")
+    st.caption(f"当前目标: `{selected_market}` · `{selected_ticker}`")
+
+    if selected_market in ("US", "CN", "HK"):
+        ticker = render_d1_stock(
+            market=selected_market,
+            ticker_override=selected_ticker,
+        )
         st.divider()
         col_d2, col_d3 = st.columns([1, 1], gap="medium")
         with col_d2:
-            render_d2_us(ticker)
+            render_d2_stock(ticker=ticker, market=selected_market)
         with col_d3:
-            render_d3_us(ticker)
-
-# =====================================================================
-#  A股
-# =====================================================================
-with tab_cn:
-    CNAnalyzer().run()
-
-# =====================================================================
-#  港股
-# =====================================================================
-with tab_hk:
-    HKAnalyzer().run()
+            render_d3_stock(ticker=ticker, market=selected_market)
 
 # =====================================================================
 #  已分析股票 — cross-market browsing
@@ -256,8 +369,8 @@ def _infer_market(ticker: str) -> str:
     """Guess the market from ticker format when no 'market' tag is stored."""
     t = ticker.strip()
     if t.replace(".", "").isdigit():
-        return "HK" if len(t) <= 5 else "CN"
-    return "US"
+        return "GLOBAL"
+    return "GLOBAL"
 
 
 def _has_fcf_table(ticker: str, market: str) -> bool:
@@ -294,19 +407,35 @@ def _dcf_metrics_from_data(data: dict) -> tuple[float, float]:
 def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
     from gemini_chat import load_fcf_table
 
+    def _resolve_chart_market(tk: str, info: dict) -> str:
+        """Map mixed legacy/new tracker market tags to chart-store market folder."""
+        stored = str(info.get("market") or "").upper()
+        if stored in ("US", "CN", "HK"):
+            return stored
+        inferred = _infer_market(tk)
+        if inferred in ("US", "CN", "HK"):
+            return inferred
+        # GLOBAL mode currently reuses US chart/store path for single-stock UI.
+        return "US"
+
     analyzed = get_analyzed_tickers()
-    currency = {"US": "USD", "CN": "CNY", "HK": "HKD"}.get(market, "USD")
+    currency = {"US": "USD", "CN": "CNY", "HK": "HKD", "GLOBAL": "USD"}.get(market, "USD")
 
     # Filter tickers belonging to this market
     market_items = {}
     for tk, info in analyzed.items():
         stored_mkt = info.get("market", "").upper()
         inferred = stored_mkt if stored_mkt else _infer_market(tk)
-        if inferred == market:
+        if market == "GLOBAL":
+            # Global reviewed page keeps single-stock (US/GLOBAL) flow only.
+            if inferred in ("CN", "HK"):
+                continue
+            market_items[tk] = info
+        elif inferred == market:
             market_items[tk] = info
 
     if not market_items:
-        label = {"US": "美股", "CN": "A股", "HK": "港股"}.get(market, market)
+        label = {"US": "美股", "CN": "A股", "HK": "港股", "GLOBAL": "个股"}.get(market, market)
         st.info(f"尚未分析任何{label}。请在对应分析中心中完成首次分析后再来查看。")
         return
 
@@ -356,7 +485,7 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
             if dcf_cache_key in st.session_state:
                 return st.session_state[dcf_cache_key]
             try:
-                chart_data = load_chart(tk, market)
+                chart_data = load_chart(tk, _resolve_chart_market(tk, info))
                 if chart_data:
                     result = _dcf_metrics_from_data(chart_data)
                     # Write back to tracker so future sessions always hit the fast path
@@ -533,7 +662,8 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
     # ── Shared helper: load and switch to a specific ticker ───────────
     def _load_and_switch(target_tk: str):
         """Load chart data for target_tk and store in session_state."""
-        _data = load_chart(target_tk, market)
+        _info = market_items.get(target_tk, {})
+        _data = load_chart(target_tk, _resolve_chart_market(target_tk, _info))
         if _data is None:
             try:
                 _data = analyzer.fetch_data(target_tk)
@@ -615,7 +745,8 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
         _idx = _sorted.index(_cur_tk) if _cur_tk in _sorted else -1
         _next_tk = _sorted[(_idx + 1) % len(_sorted)]
 
-        _data = load_chart(_next_tk, market)
+        _info = market_items.get(_next_tk, {})
+        _data = load_chart(_next_tk, _resolve_chart_market(_next_tk, _info))
         if _data is not None:
             st.session_state[f"rev_{market}_data"] = _data
             st.session_state[f"rev_{market}_ticker"] = _next_tk
@@ -659,17 +790,11 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
 
 
 with tab_reviewed:
-    st.subheader("📋 已分析股票")
-    rev_us, rev_cn, rev_hk = st.tabs(["🇺🇸 美股", "🇨🇳 A股", "🇭🇰 港股"])
-
-    with rev_us:
-        _render_reviewed_market("US", USAnalyzer(), "us_universe")
-
-    with rev_cn:
-        _render_reviewed_market("CN", CNAnalyzer(), "cn_universe")
-
-    with rev_hk:
-        _render_reviewed_market("HK", HKAnalyzer(), None)
+    if not ENABLE_REVIEWED_TAB:
+        render_factor_lab(st)
+    else:
+        st.subheader("📋 已分析股票")
+        _render_reviewed_market("GLOBAL", USAnalyzer(), "us_universe")
 
 
 # =====================================================================

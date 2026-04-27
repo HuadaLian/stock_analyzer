@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from db.data_quality_spec import QUALITY_DIMENSIONS
+
 _REPO = Path(__file__).resolve().parents[1]
 CACHE_DIR = _REPO / "reports" / "db_quality_cache"
 REPORT_PATH = CACHE_DIR / "report.json"
 STATE_PATH = CACHE_DIR / "state.json"
-US_AUDIT_PATH = CACHE_DIR / "us_audit.md"
+GLOBAL_AUDIT_PATH = CACHE_DIR / "global_audit.md"
 
 
 def _read_json(path: Path) -> dict | None:
@@ -41,6 +43,19 @@ def render_db_quality_tab(st) -> None:
             "- **强制全量重跑**：`python -m reports.run_db_quality_audit --force`\n"
             "- **24 小时内已完整跑完**：再次执行会提示跳过（需 `--force` 才重跑）。"
         )
+
+        with st.expander("质量维度与检测形式（与 `db/data_quality_spec.py` 一致）", expanded=False):
+            rows = [
+                {
+                    "代码": d.code,
+                    "维度": d.title_zh,
+                    "层级": d.layer_zh,
+                    "检测要点": d.detection_zh,
+                    "实现位置": d.implements,
+                }
+                for d in QUALITY_DIMENSIONS
+            ]
+            st.dataframe(rows, use_container_width=True, hide_index=True)
 
         if state:
             tot = int(state.get("total") or 0)
@@ -85,15 +100,15 @@ def render_db_quality_tab(st) -> None:
             st.info("审查仍在进行中；后台脚本在每个 checkpoint 会更新缓存文件。")
 
         st.markdown("---")
-        st.markdown("### US 数据审计（Markdown 摘要）")
+        st.markdown("### 全局数据审计（Markdown 摘要）")
         excerpt = (report.get("us_audit_excerpt") or "").strip()
         if excerpt:
             st.markdown(excerpt)
         else:
-            st.caption("暂无摘要；完整内容见本地文件：" + str(US_AUDIT_PATH))
-        if US_AUDIT_PATH.is_file():
-            with st.expander("查看完整 us_audit.md（本地文件，截断显示）"):
-                st.code(US_AUDIT_PATH.read_text(encoding="utf-8")[:120_000], language="markdown")
+            st.caption("暂无摘要；完整内容见本地文件：" + str(GLOBAL_AUDIT_PATH))
+        if GLOBAL_AUDIT_PATH.is_file():
+            with st.expander("查看完整 global_audit.md（本地文件，截断显示）"):
+                st.code(GLOBAL_AUDIT_PATH.read_text(encoding="utf-8")[:120_000], language="markdown")
 
         sample = report.get("not_ready_sample") or []
         if sample:

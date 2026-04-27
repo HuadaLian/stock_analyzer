@@ -12,12 +12,22 @@ import json
 import time
 from collections import OrderedDict
 from datetime import datetime
+from core.instrument_policy import get_policy
 
 BASE_DIR = os.path.dirname(__file__)
 CACHE_DIR = os.path.join(BASE_DIR, "saved_tables")
 UNIVERSE_FILE = os.path.join(CACHE_DIR, "cn_universe.json")
 CN_FILINGS_DIR = os.path.join(BASE_DIR, "CN_Filings")
 _CACHE_MAX_AGE_DAYS = 7
+
+
+def _is_a_share_common(market_text: str) -> bool:
+    """True for A-share ordinary boards; excludes B-share labels."""
+    m = (market_text or "").strip().upper()
+    if not m:
+        return True
+    # Tushare market examples: 主板/创业板/科创板/CDR/B股...
+    return "B" not in m
 
 
 def _load_tushare_token() -> str:
@@ -40,7 +50,7 @@ def _load_tushare_token() -> str:
     return ""
 
 
-def _fetch_from_tushare(token: str, progress_callback=None) -> OrderedDict:
+def _fetch_from_tushare(token: str, progress_callback=None, *, filter_mode: str | None = None) -> OrderedDict:
     """Fetch all currently listed A-share stocks from Tushare stock_basic."""
     import tushare as ts
 
@@ -48,6 +58,7 @@ def _fetch_from_tushare(token: str, progress_callback=None) -> OrderedDict:
         progress_callback("📡 正在从 Tushare 获取 A 股上市公司列表...")
 
     pro = ts.pro_api(token)
+    policy = get_policy(filter_mode)
     df = pro.stock_basic(
         exchange="",
         list_status="L",
@@ -62,11 +73,14 @@ def _fetch_from_tushare(token: str, progress_callback=None) -> OrderedDict:
         code = str(row.get("symbol", "")).strip().zfill(6)
         if not code or len(code) != 6:
             continue
+        market = str(row.get("market", "") or "")
+        if policy.cn_exclude_b_share and not _is_a_share_common(market):
+            continue
         result[code] = {
             "name":       str(row.get("name",       "") or ""),
             "industry":   str(row.get("industry",   "") or ""),
             "area":       str(row.get("area",       "") or ""),
-            "market":     str(row.get("market",     "") or ""),
+            "market":     market,
             "list_date":  str(row.get("list_date",  "") or ""),
             "source":     "tushare",
         }
@@ -114,7 +128,7 @@ def _fetch_from_local(progress_callback=None) -> OrderedDict:
     return result
 
 
-def fetch_cn_universe(force_refresh: bool = False, progress_callback=None) -> OrderedDict:
+def fetch_cn_universe(force_refresh: bool = False, progress_callback=None, filter_mode: str | None = None) -> OrderedDict:
     """Return OrderedDict {code: {"name", "industry", "area", "market", "list_date", "source"}}.
 
     Tries Tushare first (requires TUSHARE_TOKEN in env or .env).
@@ -151,7 +165,7 @@ def fetch_cn_universe(force_refresh: bool = False, progress_callback=None) -> Or
 
     if token:
         try:
-            result = _fetch_from_tushare(token, progress_callback)
+            result = _fetch_from_tushare(token, progress_callback, filter_mode=filter_mode)
             source_label = "tushare"
         except Exception as e:
             if progress_callback:

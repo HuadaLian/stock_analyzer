@@ -1,4 +1,4 @@
-"""Dashboard D1: price chart with EMA and DCF overlays (US)."""
+"""Dashboard D1: price chart with EMA and DCF overlays."""
 
 from __future__ import annotations
 
@@ -22,9 +22,10 @@ from db.repository import (
 )
 from db.schema import get_conn
 from dashboards.cache import get_all_tickers_cached
+from dashboards.market_features import get_market_features
 from etl.loader import upsert_ohlcv_daily, upsert_ohlcv_ema, upsert_fmp_dcf_history
 from etl.sources.fmp_dcf import fetch_fmp_dcf_history
-from etl.sources.fmp import fetch_profile, fetch_ohlcv
+from etl.sources.fmp import fetch_profile, fetch_ohlcv, fetch_fx_to_usd
 from data_provider import _fmp_analyst_data
 from futu_client import FutuClient
 
@@ -34,6 +35,201 @@ _DCF_COLORS = {
     "dcf_24x": "#10b981",
     "dcf_34x": "#f59e0b",
 }
+
+_CCY_SYMBOL = {
+    "USD": "$",
+    "EUR": "EUR ",
+    "GBP": "GBP ",
+    "JPY": "JPY ",
+    "CNY": "¥",
+    "CNH": "CNH ",
+    "HKD": "HK$",
+    "SGD": "SGD ",
+    "AUD": "AUD ",
+    "NZD": "NZD ",
+    "CAD": "CAD ",
+    "CHF": "CHF ",
+    "SEK": "SEK ",
+    "NOK": "NOK ",
+    "DKK": "DKK ",
+    "KRW": "KRW ",
+    "INR": "INR ",
+    "TWD": "TWD ",
+    "THB": "THB ",
+    "MYR": "MYR ",
+    "IDR": "IDR ",
+    "PHP": "PHP ",
+    "VND": "VND ",
+    "BRL": "BRL ",
+    "MXN": "MXN ",
+    "ZAR": "ZAR ",
+    "TRY": "TRY ",
+    "RUB": "RUB ",
+    "AED": "AED ",
+    "SAR": "SAR ",
+}
+
+
+def _currency_symbol(ccy: str | None) -> str:
+    return _CCY_SYMBOL.get(str(ccy or "USD").upper(), f"{str(ccy or 'USD').upper()} ")
+
+
+def _rate_on_or_before(fx_dict: dict[str, float], target_date: str | date | datetime | pd.Timestamp) -> float | None:
+    if not fx_dict:
+        return None
+    s = str(pd.Timestamp(target_date).date())
+    for d in sorted(fx_dict.keys(), reverse=True):
+        if d <= s:
+            return float(fx_dict[d])
+    oldest = min(fx_dict.keys())
+    return float(fx_dict[oldest])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_fx_to_usd_series(currency: str, date_from: str, date_to: str) -> dict[str, float]:
+    return fetch_fx_to_usd(currency=currency, date_from=date_from, date_to=date_to)
+
+
+def _convert_usd_to_listing_value(
+    usd_value: float | None,
+    *,
+    listing_currency: str,
+    reporting_currency: str | None,
+    fx_to_usd: float | None,
+    anchor_date: str | date | datetime | pd.Timestamp | None,
+    listing_fx_dict: dict[str, float] | None = None,
+) -> float | None:
+    if usd_value is None or pd.isna(usd_value):
+        return None
+    listing = (listing_currency or "USD").upper()
+    if listing == "USD":
+        return float(usd_value)
+    rep = (reporting_currency or "").upper()
+    if rep == listing and fx_to_usd and float(fx_to_usd) > 0:
+        return float(usd_value) / float(fx_to_usd)
+    if listing_fx_dict and anchor_date is not None:
+        r = _rate_on_or_before(listing_fx_dict, anchor_date)
+        if r and r > 0:
+            return float(usd_value) / float(r)
+    return float(usd_value)
+
+
+def _convert_dcf_history_for_listing(
+    df_dcf_hist: pd.DataFrame,
+    df_fund: pd.DataFrame,
+    listing_currency: str,
+) -> pd.DataFrame:
+    if df_dcf_hist.empty or (listing_currency or "USD").upper() == "USD":
+        return df_dcf_hist
+    out = df_dcf_hist.copy()
+    f = df_fund.copy() if df_fund is not None else pd.DataFrame()
+    if f.empty:
+        return out
+    fy_map: dict[int, dict] = {}
+    for _, r in f.iterrows():
+        fy = pd.to_numeric(r.get("fiscal_year"), errors="coerce")
+        if pd.isna(fy):
+            continue
+        fy_map[int(fy)] = {
+            "reporting_currency": str(r.get("reporting_currency") or "").upper(),
+            "fx_to_usd": pd.to_numeric(r.get("fx_to_usd"), errors="coerce"),
+        }
+    if not fy_map:
+        return out
+
+    listing_fx_dict: dict[str, float] | None = None
+    if (listing_currency or "USD").upper() != "USD":
+        start = str(pd.to_datetime(out["anchor_date"]).min().date())
+        end = str(pd.to_datetime(out["anchor_date"]).max().date())
+        try:
+            listing_fx_dict = _load_fx_to_usd_series((listing_currency or "USD").upper(), start, end)
+        except Exception:
+            listing_fx_dict = None
+
+    for idx, row in out.iterrows():
+        fy = pd.to_numeric(row.get("fiscal_year"), errors="coerce")
+        if pd.isna(fy):
+            continue
+        meta = fy_map.get(int(fy))
+        if not meta:
+            continue
+        for col in ["fcf_ps_avg3yr", "dcf_14x", "dcf_24x", "dcf_34x"]:
+            v = pd.to_numeric(row.get(col), errors="coerce")
+            if pd.isna(v):
+                continue
+            out.at[idx, col] = _convert_usd_to_listing_value(
+                float(v),
+                listing_currency=listing_currency,
+                reporting_currency=meta.get("reporting_currency"),
+                fx_to_usd=meta.get("fx_to_usd"),
+                anchor_date=row.get("anchor_date"),
+                listing_fx_dict=listing_fx_dict,
+            )
+    return out
+
+
+def _convert_fund_for_listing(df_fund: pd.DataFrame, listing_currency: str) -> pd.DataFrame:
+    if df_fund.empty or (listing_currency or "USD").upper() == "USD":
+        return df_fund
+    out = df_fund.copy()
+    for idx, row in out.iterrows():
+        v = pd.to_numeric(row.get("fcf_per_share"), errors="coerce")
+        if pd.isna(v):
+            continue
+        out.at[idx, "fcf_per_share"] = _convert_usd_to_listing_value(
+            float(v),
+            listing_currency=listing_currency,
+            reporting_currency=row.get("reporting_currency"),
+            fx_to_usd=pd.to_numeric(row.get("fx_to_usd"), errors="coerce"),
+            anchor_date=row.get("fiscal_end_date") or row.get("filing_date"),
+        )
+    return out
+
+
+def _convert_fmp_dcf_for_listing(
+    df_fmp_dcf: pd.DataFrame,
+    df_fund: pd.DataFrame,
+    listing_currency: str,
+) -> pd.DataFrame:
+    """Normalize FMP DCF display into listing currency when needed."""
+    if df_fmp_dcf.empty or (listing_currency or "USD").upper() == "USD":
+        return df_fmp_dcf
+    out = df_fmp_dcf.copy()
+    f = df_fund.copy() if df_fund is not None else pd.DataFrame()
+    if f.empty:
+        return out
+
+    listing = (listing_currency or "USD").upper()
+    reporting_set = {
+        str(v or "").upper()
+        for v in f.get("reporting_currency", pd.Series(dtype=str)).tolist()
+        if str(v or "").strip()
+    }
+    # If any annual row reports in listing currency, treat FMP DCF as already local.
+    # This avoids double conversion for cases like CN/HK tickers where FMP DCF is local.
+    if listing in reporting_set:
+        return out
+
+    start = str(pd.to_datetime(out["date"]).min().date())
+    end = str(pd.to_datetime(out["date"]).max().date())
+    try:
+        listing_fx_dict = _load_fx_to_usd_series((listing_currency or "USD").upper(), start, end)
+    except Exception:
+        return out
+
+    for idx, row in out.iterrows():
+        v = pd.to_numeric(row.get("dcf_value"), errors="coerce")
+        if pd.isna(v):
+            continue
+        out.at[idx, "dcf_value"] = _convert_usd_to_listing_value(
+            float(v),
+            listing_currency=listing_currency,
+            reporting_currency="USD",
+            fx_to_usd=None,
+            anchor_date=row.get("date"),
+            listing_fx_dict=listing_fx_dict,
+        )
+    return out
 
 
 def _ensure_ema_columns(df_ohlcv: pd.DataFrame) -> pd.DataFrame:
@@ -109,7 +305,9 @@ def _build_dcf_history_fallback(df_fund: pd.DataFrame,
 def _build_chart(df_ohlcv: pd.DataFrame,
                  df_dcf_hist: pd.DataFrame,
                  df_fmp_dcf: pd.DataFrame,
-                 ticker: str) -> go.Figure:
+                 ticker: str,
+                 display_currency: str = "USD",
+                 currency_symbol: str = "$") -> go.Figure:
     latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
 
     fig = go.Figure()
@@ -182,7 +380,7 @@ def _build_chart(df_ohlcv: pd.DataFrame,
                 name="FMP DCF",
                 line=dict(color="#ff4dd2", width=2.6, dash="dot"),
                 mode="lines",
-                hovertemplate="FMP DCF: $%{y:,.2f}<extra></extra>",
+                hovertemplate=f"FMP DCF: {currency_symbol}%{{y:,.2f}}<extra></extra>",
             ))
 
     annotations = []
@@ -190,7 +388,7 @@ def _build_chart(df_ohlcv: pd.DataFrame,
         annotations.append(dict(
             x=df_ohlcv["date"].iloc[-1],
             y=latest_price,
-            text=f"  ${latest_price:,.2f}",
+            text=f"  {currency_symbol}{latest_price:,.2f}",
             showarrow=False,
             font=dict(color="#00d4ff", size=14, family="monospace"),
             xanchor="left",
@@ -235,7 +433,7 @@ def _build_chart(df_ohlcv: pd.DataFrame,
 
     fig.update_layout(
         title=dict(text=f"{ticker.upper()} 日K线", font=dict(color="#e0e7ff", size=20)),
-        yaxis_title="价格 (USD)",
+        yaxis_title=f"价格 ({display_currency})",
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
         paper_bgcolor="#0a0e17",
@@ -264,7 +462,7 @@ def _build_chart(df_ohlcv: pd.DataFrame,
             range=[y_bottom, y_top],
             fixedrange=False,
             tickfont=dict(size=13, color="#cbd5e1"),
-            title=dict(text="价格 (USD)", font=dict(size=15, color="#cbd5e1")),
+            title=dict(text=f"价格 ({display_currency})", font=dict(size=15, color="#cbd5e1")),
         ),
         annotations=annotations,
     )
@@ -952,6 +1150,7 @@ def _render_metrics_panel(
     df_fund: pd.DataFrame,
     df_fmp_dcf: pd.DataFrame,
     company: dict | None,
+    currency_symbol: str = "$",
 ) -> None:
     """Render right-side compact metrics without oversized cards.
 
@@ -961,12 +1160,12 @@ def _render_metrics_panel(
     with st.container():
         # Latest price
         latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
-        latest_price_text = f"${latest_price:,.2f}" if latest_price else "—"
+        latest_price_text = f"{currency_symbol}{latest_price:,.2f}" if latest_price else "—"
         
         # Market cap
         market_cap = company.get("market_cap") if company else None
         if market_cap and market_cap > 0:
-            mcap_display = f"${market_cap:,.0f}M" if market_cap >= 1000 else f"${market_cap:,.0f}M"
+            mcap_display = f"{currency_symbol}{market_cap:,.0f}M" if market_cap >= 1000 else f"{currency_symbol}{market_cap:,.0f}M"
         else:
             mcap_display = "—"
         market_cap_text = mcap_display
@@ -977,7 +1176,7 @@ def _render_metrics_panel(
             latest_fcf_ps = df_fund_sorted.iloc[0].get("fcf_per_share")
             if latest_fcf_ps is not None:
                 latest_fcf_ps = float(latest_fcf_ps)
-                latest_fcf_text = f"${latest_fcf_ps:,.2f}"
+                latest_fcf_text = f"{currency_symbol}{latest_fcf_ps:,.2f}"
             else:
                 latest_fcf_text = "—"
             
@@ -988,7 +1187,7 @@ def _render_metrics_panel(
                 avg_fcf = df_fund_sorted["fcf_per_share"].astype(float).mean()
             
             if not pd.isna(avg_fcf) and avg_fcf > 0:
-                avg_fcf_text = f"${avg_fcf:,.2f}"
+                avg_fcf_text = f"{currency_symbol}{avg_fcf:,.2f}"
             else:
                 avg_fcf_text = "—"
         else:
@@ -999,7 +1198,7 @@ def _render_metrics_panel(
         if df_fmp_dcf is not None and not df_fmp_dcf.empty:
             fmp_latest = df_fmp_dcf.iloc[-1]
             fmp_dcf_val = float(fmp_latest.get("dcf_value", 0))
-            fmp_dcf_text = f"${fmp_dcf_val:,.2f}" if fmp_dcf_val > 0 else "—"
+            fmp_dcf_text = f"{currency_symbol}{fmp_dcf_val:,.2f}" if fmp_dcf_val > 0 else "—"
         else:
             fmp_dcf_text = "—"
 
@@ -1015,15 +1214,21 @@ def _render_metrics_panel(
         st.markdown(metrics_html, unsafe_allow_html=True)
 
 
-def render_d1_us() -> str:
+def render_d1_stock(market: str = "US", ticker_override: str | None = None) -> str:
     st.subheader("D1: 价格图线")
-    ticker_df = get_all_tickers_cached(market="US")
+    market_u = (market or "US").strip().upper()
+    features = get_market_features(market_u)
+    ticker_df = get_all_tickers_cached(market=market_u)
     ticker_options = sorted(ticker_df["ticker"].dropna().astype(str).unique().tolist()) if not ticker_df.empty else []
-    default_ticker = st.session_state.get("d1_us_ticker", "NVDA").strip().upper()
+    default_ticker = str(
+        ticker_override
+        or st.session_state.get(f"d1_{market_u.lower()}_ticker")
+        or ("NVDA" if market_u == "US" else "")
+    ).strip().upper()
     if default_ticker and default_ticker not in ticker_options:
         ticker_options = [default_ticker] + ticker_options
     if not ticker_options:
-        ticker_options = ["NVDA"]
+        ticker_options = [default_ticker or "NVDA"]
 
     # Main layout: chart ~70%, right panel ~30%
     col_left, col_right = st.columns([7, 3], gap="medium")
@@ -1036,15 +1241,22 @@ def render_d1_us() -> str:
                 "Ticker",
                 options=ticker_options,
                 index=ticker_options.index(default_ticker) if default_ticker in ticker_options else 0,
-                key="d1_us_ticker_select",
+                key=f"d1_{market_u.lower()}_ticker_select",
                 help="输入字符可搜索股票代码",
                 label_visibility="collapsed",
             )
-        st.session_state["d1_us_ticker"] = ticker
+        st.session_state[f"d1_{market_u.lower()}_ticker"] = ticker
         with c_dt:
-            start_date = st.date_input("起始日期", value=pd.Timestamp("2000-01-01"), key="d1_us_start", label_visibility="collapsed")
+            start_date = st.date_input(
+                "起始日期",
+                value=pd.Timestamp("2000-01-01"),
+                key=f"d1_{market_u.lower()}_start",
+                label_visibility="collapsed",
+            )
         with c_rf:
-            do_refresh = st.button("刷新", key=f"refresh_top_{ticker}", type="secondary", width="stretch")
+            do_refresh = False
+            if market_u == "US":
+                do_refresh = st.button("刷新", key=f"refresh_top_{market_u}_{ticker}", type="secondary", width="stretch")
 
     if do_refresh:
         success, msg = _refresh_latest_fmp_data(ticker)
@@ -1072,16 +1284,36 @@ def render_d1_us() -> str:
         company = get_company(ticker, conn=conn)
         dcf_metrics = get_dcf_metrics(ticker, conn=conn)
 
-    fig = _build_chart(df_ohlcv, df_dcf_hist, df_fmp_dcf, ticker=ticker)
+    listing_currency = str((company or {}).get("currency") or features.display_currency or "USD").upper()
+    currency_symbol = _currency_symbol(listing_currency)
+    df_fund_display = _convert_fund_for_listing(df_fund, listing_currency)
+    df_dcf_hist_display = _convert_dcf_history_for_listing(df_dcf_hist, df_fund, listing_currency)
+    df_fmp_dcf_display = _convert_fmp_dcf_for_listing(df_fmp_dcf, df_fund, listing_currency)
+
+    fig = _build_chart(
+        df_ohlcv,
+        df_dcf_hist_display,
+        df_fmp_dcf_display,
+        ticker=ticker,
+        display_currency=listing_currency,
+        currency_symbol=currency_symbol,
+    )
 
     with col_left:
         st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
         _render_notes_panel_d1(ticker)
 
     with col_right:
-        _render_metrics_panel(ticker, df_ohlcv, df_fund, df_fmp_dcf, company)
-        latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
-        _render_analyst_panel_d1(ticker, latest_price)
-        _render_price_alert_panel_d1(ticker, dcf_metrics)
+        _render_metrics_panel(ticker, df_ohlcv, df_fund_display, df_fmp_dcf_display, company, currency_symbol=currency_symbol)
+        if features.supports_analyst_panel:
+            latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
+            _render_analyst_panel_d1(ticker, latest_price)
+        if features.supports_price_alert:
+            _render_price_alert_panel_d1(ticker, dcf_metrics)
 
     return ticker
+
+
+def render_d1_us() -> str:
+    """Backward-compatible alias."""
+    return render_d1_stock(market="US")

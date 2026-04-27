@@ -507,10 +507,10 @@ def _render_peer_table(peers: pd.DataFrame, ticker: str) -> None:
     )
 
 
-def render_d3_us(ticker: str | None = None) -> None:
+def render_d3_stock(ticker: str | None = None, market: str = "US") -> None:
     st.subheader("D3: 行业内比较")
-
-    ticker = str(ticker or st.session_state.get("d1_us_ticker") or "").strip().upper()
+    m = (market or "US").strip().lower()
+    ticker = str(ticker or st.session_state.get(f"d1_{m}_ticker") or "").strip().upper()
     if not ticker:
         st.info("尚未选择股票")
         return
@@ -580,3 +580,8 @@ def render_d3_us(ticker: str | None = None) -> None:
 
     with st.expander("查看行业公司列表", expanded=True):
         _render_peer_table(peers, ticker)
+
+
+def render_d3_us(ticker: str | None = None) -> None:
+    """Backward-compatible alias."""
+    render_d3_stock(ticker=ticker, market="US")

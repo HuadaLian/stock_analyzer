@@ -50,7 +50,8 @@ def get_fundamentals(ticker: str, *, conn=None) -> pd.DataFrame:
     with _resolve(conn) as c:
         return c.execute("""
             SELECT fiscal_year, fiscal_end_date, filing_date,
-                   fcf, fcf_per_share, shares_out, currency
+                   fcf, fcf_per_share, shares_out, currency,
+                   reporting_currency, fx_to_usd
             FROM fundamentals_annual
             WHERE ticker = ?
             ORDER BY fiscal_year DESC
@@ -96,10 +97,10 @@ def get_fmp_dcf_history(ticker: str, *, conn=None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def get_company(ticker: str, *, conn=None) -> dict | None:
-    """Get company info (name, sector, shares_out, market_cap from latest OHLCV)."""
+    """Get company info (name, sector, currency, shares_out, latest market_cap)."""
     with _resolve(conn) as c:
         cur = c.execute(
-            "SELECT ticker, market, name, sector, shares_out FROM companies WHERE ticker = ?",
+            "SELECT ticker, market, name, sector, shares_out, currency FROM companies WHERE ticker = ?",
             [ticker]
         )
         row = cur.fetchone()
@@ -118,6 +119,7 @@ def get_company(ticker: str, *, conn=None) -> dict | None:
         "name": row[2],
         "sector": row[3],
         "shares_out": float(row[4]) if row[4] else None,
+        "currency": row[5] or "USD",
         "market_cap": float(mcap_row[0]) if mcap_row and mcap_row[0] else None,
     }
 

@@ -211,13 +211,13 @@ def _render_safety_panel(ticker: str) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
-def render_d2_us(ticker: str | None = None) -> None:
+def render_d2_stock(ticker: str | None = None, market: str = "US") -> None:
     st.subheader("D2: 公司业务画像")
-
-    ticker = str(ticker or st.session_state.get("d1_us_ticker") or "").strip().upper()
+    m = (market or "US").strip().lower()
+    ticker = str(ticker or st.session_state.get(f"d1_{m}_ticker") or "").strip().upper()
     if not ticker:
         ticker = _fallback_ticker()
-        st.session_state["d1_us_ticker"] = ticker
+        st.session_state[f"d1_{m}_ticker"] = ticker
 
     st.caption(f"当前股票：{ticker}（与 D1 共享）")
 
@@ -231,3 +231,8 @@ def render_d2_us(ticker: str | None = None) -> None:
         _render_management_panel(ticker, profile)
     with c2:
         _render_safety_panel(ticker)
+
+
+def render_d2_us(ticker: str | None = None) -> None:
+    """Backward-compatible alias."""
+    render_d2_stock(ticker=ticker, market="US")
