@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pandas as pd
+import plotly.graph_objects as go
 from db.data_quality_spec import QUALITY_DIMENSIONS
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -21,6 +23,38 @@ def _read_json(path: Path) -> dict | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _pie_from_pairs(rows: list[dict], label_key: str, title: str) -> go.Figure | None:
+    if not rows:
+        return None
+    labels = [str(r.get(label_key) or "") for r in rows]
+    values = [int(r.get("count") or 0) for r in rows]
+    if sum(values) <= 0:
+        return None
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.32,
+                textinfo="label+percent",
+                textposition="inside",
+                hovertemplate="%{label}<br>家数: %{value:,}<br>占比: %{percent}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=15, color="#e0e7ff"), x=0.5, xanchor="center"),
+        paper_bgcolor="rgba(15,22,41,0.6)",
+        plot_bgcolor="rgba(15,22,41,0.3)",
+        font=dict(color="#cbd5e1"),
+        margin=dict(t=48, b=24, l=24, r=24),
+        height=360,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.22, x=0.5, xanchor="center"),
+    )
+    return fig
 
 
 def render_db_quality_tab(st) -> None:
@@ -88,9 +122,100 @@ def render_db_quality_tab(st) -> None:
         m4.metric("报告生成", report.get("generated_at", "—"))
 
         c_ema, c_dcf, c_fmp = st.columns(3)
-        c_ema.metric("EMA 就绪", agg.get("d1_ema_ready", "—"))
+        c_ema.metric("EMA 就绪（日 K 衍生）", agg.get("d1_ema_ready", "—"))
         c_dcf.metric("DCF 历史就绪", agg.get("d1_dcf_ready", "—"))
         c_fmp.metric("FMP DCF 就绪", agg.get("d1_fmp_dcf_ready", "—"))
+
+        portrait = report.get("company_portrait")
+        if portrait:
+            st.markdown("---")
+            st.markdown("### 企业库分布与基本面完整度（全 `companies` 口径）")
+            st.caption(
+                "由审查脚本对数据库即时聚合写入 `report.json` → `company_portrait`；"
+                "与上方「FMP 普通股 universe」逐 ticker 扫描互补。"
+            )
+            if portrait.get("error"):
+                st.error(f"企业全景统计失败：{portrait['error']}")
+            else:
+                pc1, pc2 = st.columns(2, gap="medium")
+                fig_m = _pie_from_pairs(portrait.get("by_market") or [], "market", "按市场 market")
+                fig_c = _pie_from_pairs(portrait.get("by_country_chart") or [], "country", "按国家/地区 country（长尾并入「其他」）")
+                with pc1:
+                    if fig_m:
+                        st.plotly_chart(fig_m, width="stretch")
+                    else:
+                        st.caption("暂无 market 分布数据")
+                with pc2:
+                    if fig_c:
+                        st.plotly_chart(fig_c, width="stretch")
+                    else:
+                        st.caption("暂无 country 分布数据")
+
+                fa = portrait.get("fundamentals_annual") or {}
+                st.markdown("#### 年报 `fundamentals_annual`（收入 / FCF）")
+                f1, f2, f3, f4 = st.columns(4)
+                f1.metric("表总行数", f"{fa.get('rows_total', 0):,}")
+                f2.metric("行含 revenue", f"{fa.get('rows_with_revenue', 0):,}")
+                f3.metric("行含 FCF", f"{fa.get('rows_with_fcf', 0):,}")
+                f4.metric("同行 revenue+FCF", f"{fa.get('rows_with_revenue_and_fcf', 0):,}")
+                g1, g2, g3, g4 = st.columns(4)
+                g1.metric("公司有任意年报", f"{fa.get('distinct_companies_any_row', 0):,}", f"{fa.get('pct_of_companies_with_any_annual', 0)}%")
+                g2.metric("公司有 revenue", f"{fa.get('distinct_companies_with_revenue_any_year', 0):,}", f"{fa.get('pct_of_companies_with_revenue', 0)}%")
+                g3.metric("公司有 FCF", f"{fa.get('distinct_companies_with_fcf_any_year', 0):,}", f"{fa.get('pct_of_companies_with_fcf', 0)}%")
+                g4.metric("公司同年 revenue+FCF", f"{fa.get('distinct_companies_with_revenue_and_fcf_same_year', 0):,}", f"{fa.get('pct_of_companies_with_revenue_and_fcf', 0)}%")
+
+                comp_rows = max(int(portrait.get("companies_total") or 0), 1)
+                bar_df = pd.DataFrame(
+                    {
+                        "指标": [
+                            "至少一行年报",
+                            "至少一年有 revenue",
+                            "至少一年有 FCF",
+                            "至少一年同年 revenue+FCF",
+                        ],
+                        "公司占比 %": [
+                            float(fa.get("pct_of_companies_with_any_annual") or 0),
+                            float(fa.get("pct_of_companies_with_revenue") or 0),
+                            float(fa.get("pct_of_companies_with_fcf") or 0),
+                            float(fa.get("pct_of_companies_with_revenue_and_fcf") or 0),
+                        ],
+                    }
+                )
+                fig_bar = go.Figure(
+                    data=[
+                        go.Bar(
+                            x=bar_df["指标"],
+                            y=bar_df["公司占比 %"],
+                            marker_color=["#6366f1", "#22c55e", "#f59e0b", "#e879f9"],
+                            text=[f"{v:.1f}%" for v in bar_df["公司占比 %"]],
+                            textposition="outside",
+                        )
+                    ]
+                )
+                fig_bar.update_layout(
+                    title="占全库 companies 比例（基本面覆盖）",
+                    paper_bgcolor="rgba(15,22,41,0.6)",
+                    plot_bgcolor="rgba(15,22,41,0.3)",
+                    font=dict(color="#cbd5e1"),
+                    yaxis=dict(title="占比（%）", range=[0, max(105.0, float(bar_df["公司占比 %"].max()) * 1.15)]),
+                    height=340,
+                    margin=dict(t=56, b=80, l=48, r=24),
+                )
+                st.plotly_chart(fig_bar, width="stretch")
+
+                hm = portrait.get("high_mcap") or {}
+                th = hm.get("threshold_market_cap_millions", 0)
+                st.markdown(f"#### 高市值基本面缺口（最新市值 ≥ **{th:,.0f}** 百万）")
+                h1, h2, h3 = st.columns(3)
+                h1.metric("达阈值公司数", f"{hm.get('count_companies_at_or_above_threshold', 0):,}")
+                h2.metric("其中年报 revenue+FCF 齐全", f"{hm.get('count_with_annual_revenue_and_fcf', 0):,}")
+                h3.metric("达阈值集合内缺口径占比", f"{hm.get('pct_above_threshold_missing_rev_or_fcf', 0)}%")
+                miss = hm.get("sample_missing_rev_fcf") or []
+                if miss:
+                    st.caption("以下在达阈值下仍无「同年 revenue+FCF」年报行（按市值降序，可优先补数）")
+                    st.dataframe(pd.DataFrame(miss), use_container_width=True, hide_index=True)
+        elif int(report.get("version") or 0) < 3:
+            st.info("当前 `report.json` 为旧版（无 `company_portrait`）。请运行 `python -m reports.run_db_quality_audit --force` 生成企业分布与基本面统计。")
 
         if report.get("complete"):
             st.success("本轮审查已完成。")

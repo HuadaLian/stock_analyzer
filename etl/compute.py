@@ -32,17 +32,15 @@ def compute_short_potential(latest_price: float | None,
 
 
 def compute_invest_potential(latest_price: float | None,
-                             dcf_14x: float | None,
-                             dcf_24x: float | None) -> float | None:
-    """投资潜力 = (dcf_14x - latest_price) / dcf_24x.
+                             dcf_14x: float | None) -> float | None:
+    """投资潜力 = (dcf_14x - latest_price) / dcf_14x.
 
-    分子衡量价格相对保守估值线 (14x) 的折价；用 24x 而非 14x 做归一是为了
-    给一个有上界的相对值，便于跨股票比较。价格 > 14x 时为负 (无折价)。
-    inputs 缺失或 dcf_24x ≤ 0 时返回 None。
+    分子衡量价格相对保守估值线 (14x) 的折价；价格 > 14x 时为负 (无折价)。
+    inputs 缺失或 dcf_14x ≤ 0 时返回 None。
     """
-    if latest_price is None or dcf_14x is None or dcf_24x is None or dcf_24x <= 0:
+    if latest_price is None or dcf_14x is None or dcf_14x <= 0:
         return None
-    return (dcf_14x - latest_price) / dcf_24x
+    return (dcf_14x - latest_price) / dcf_14x
 
 
 def _latest_close(ticker: str,
@@ -126,7 +124,7 @@ def compute_dcf_lines(ticker: str, conn: duckdb.DuckDBPyConnection) -> dict:
 
     latest_price, latest_date = _latest_close(ticker, conn)
     short_pot = compute_short_potential(latest_price, d34)
-    invest_pot = compute_invest_potential(latest_price, d14, d24)
+    invest_pot = compute_invest_potential(latest_price, d14)
 
     upsert_dcf_metrics(conn, {
         "ticker":               ticker,

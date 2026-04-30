@@ -10,7 +10,7 @@
 """
 
 import pytest
-from etl.sources.fmp import fetch_profile
+from etl.sources.fmp import fetch_profile, infer_market
 
 
 def test_fetch_profile_converts_shares_to_millions(mock_fmp):
@@ -97,3 +97,17 @@ def test_fetch_profile_derives_shares_from_market_cap_when_field_missing(mock_fm
     expected_raw = 5_062_002_467_464 / 207.0
     assert profile["_shares_out_raw"] == pytest.approx(expected_raw)
     assert profile["shares_out"] == pytest.approx(expected_raw / 1_000_000)
+
+
+@pytest.mark.parametrize(
+    "symbol,exchange,country,expected",
+    [
+        ("AAPL", "NASDAQ", "US", "US"),
+        ("600519.SS", "SSE", "CN", "CN"),
+        ("000001.SZ", "SZSE", "CN", "CN"),
+        ("0700.HK", "HKEX", "HK", "HK"),
+        ("NESN.SW", "SIX", "CH", "GLOBAL"),
+    ],
+)
+def test_infer_market_bucket(symbol, exchange, country, expected):
+    assert infer_market(symbol, exchange, country) == expected

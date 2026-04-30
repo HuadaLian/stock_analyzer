@@ -233,7 +233,7 @@ CREATE TABLE IF NOT EXISTS dcf_metrics (
     latest_price            DOUBLE,     -- latest adj_close from ohlcv_daily (USD)
     latest_price_date       DATE,       -- date of latest_price (audit)
     short_potential         DOUBLE,     -- max(0, (latest_price - dcf_34x) / dcf_34x); 0 when underpriced
-    invest_potential        DOUBLE,     -- (dcf_14x - latest_price) / dcf_24x; negative when overpriced
+    invest_potential        DOUBLE,     -- (dcf_14x - latest_price) / dcf_14x; negative when overpriced
     computed_at             TIMESTAMP
 );
 

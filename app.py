@@ -222,13 +222,27 @@ import uuid as _uuid
 if "_sid" not in st.session_state:
     st.session_state["_sid"] = str(_uuid.uuid4())
 
-# ── Tabs ─────────────────────────────────────────────────────────────────
-tab_stock, tab_reviewed, tab_db_quality, tab_settings = st.tabs([
+# ── Main navigation（可编程切换；因子页跳转 D1 时写入 _nav_main_tab）────────
+_MAIN_NAV_LABELS = (
     "📈 个股分析中心",
     "🧪 因子分析",
     "🧪 数据库质量检测",
     "⚙️ 设置",
-])
+)
+_pending_nav = st.session_state.pop("_nav_main_tab", None)
+if _pending_nav in _MAIN_NAV_LABELS:
+    st.session_state["main_nav_tab"] = _pending_nav
+if "main_nav_tab" not in st.session_state:
+    st.session_state["main_nav_tab"] = _MAIN_NAV_LABELS[0]
+
+st.radio(
+    "主菜单",
+    options=list(_MAIN_NAV_LABELS),
+    horizontal=True,
+    key="main_nav_tab",
+    label_visibility="collapsed",
+)
+_nav = st.session_state.get("main_nav_tab") or _MAIN_NAV_LABELS[0]
 
 # Keep reviewed-page implementation in codebase, but disable in UI for now.
 ENABLE_REVIEWED_TAB = False
@@ -282,7 +296,7 @@ def _sync_read_replica_after_fill() -> tuple[bool, str]:
 # =====================================================================
 #  个股分析中心（D1 + D2 + D3）
 # =====================================================================
-with tab_stock:
+if _nav == _MAIN_NAV_LABELS[0]:
     st.subheader("📈 个股分析中心")
     st.caption("一个搜索框覆盖全球普通股（US/ADR/OTC、A股、港股）。")
 
@@ -789,7 +803,7 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
         analyzer.render_price_alert(cached_ticker, data=cached_data, key_suffix="rev")
 
 
-with tab_reviewed:
+if _nav == _MAIN_NAV_LABELS[1]:
     if not ENABLE_REVIEWED_TAB:
         render_factor_lab(st)
     else:
@@ -800,14 +814,14 @@ with tab_reviewed:
 # =====================================================================
 #  数据库质量检测（读取后台脚本写入的缓存报告）
 # =====================================================================
-with tab_db_quality:
+if _nav == _MAIN_NAV_LABELS[2]:
     render_db_quality_tab(st)
 
 
 # =====================================================================
 #  ⚙️ 设置
 # =====================================================================
-with tab_settings:
+if _nav == _MAIN_NAV_LABELS[3]:
     st.subheader("🤖 Gemini AI 设置")
     st.caption("在此配置 Gemini API Key 和模型。设置会在整个会话中持久生效。")
 

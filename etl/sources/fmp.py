@@ -52,6 +52,48 @@ def _get(endpoint: str, **params) -> list | dict:
     return data
 
 
+def _normalize_text(value: object) -> str:
+    return str(value or "").strip().upper()
+
+
+def infer_market(symbol: str, exchange: str | None, country: str | None) -> str:
+    """Infer market bucket: US / CN / HK / GLOBAL.
+
+    Rules are intentionally conservative:
+    - CN/HK first by ticker suffix and exchange keywords
+    - US by country/exchange evidence
+    - everything else falls back to GLOBAL
+    """
+    sym = _normalize_text(symbol)
+    ex = _normalize_text(exchange)
+    ctry = _normalize_text(country)
+
+    if sym.endswith((".SS", ".SZ", ".BJ")):
+        return "CN"
+    if sym.endswith(".HK"):
+        return "HK"
+
+    if "HONG KONG" in ex or ex in {"HKEX", "SEHK"} or ctry in {"HK", "HKG", "HONG KONG"}:
+        return "HK"
+
+    if (
+        "SHANGHAI" in ex
+        or "SHENZHEN" in ex
+        or ex in {"SSE", "SZSE", "BSE"}
+        or ctry in {"CN", "CHN", "CHINA"}
+    ):
+        return "CN"
+
+    us_exchanges = {
+        "NASDAQ", "NYSE", "NYSEARCA", "NYSE AMERICAN", "AMEX",
+        "BATS", "IEX", "OTC", "OTCQB", "OTCQX", "PINK",
+    }
+    if ctry in {"US", "USA", "UNITED STATES"} or ex in us_exchanges:
+        return "US"
+
+    return "GLOBAL"
+
+
 def search_symbols(query: str, limit: int = 500) -> list[dict]:
     """Search active symbols in FMP stable API.
 
@@ -129,14 +171,16 @@ def fetch_profile(ticker: str) -> dict:
 
     ex_short = p.get("exchangeShortName") or p.get("exchange")
     ex_full = (p.get("exchangeFullName") or p.get("fullExchangeName") or "").strip() or None
+    country = (p.get("country") or "").strip() or None
+    market = infer_market(ticker, ex_short, country)
 
     return {
         "ticker":      ticker.upper(),
-        "market":      "GLOBAL",
+        "market":      market,
         "name":        p.get("companyName") or p.get("name"),
         "exchange":    ex_short,
         "exchange_full_name": ex_full,
-        "country":     (p.get("country") or "").strip() or None,
+        "country":     country,
         "sector":      p.get("sector"),
         "industry":    p.get("industry"),
         "currency":    (p.get("currency") or "USD").upper(),

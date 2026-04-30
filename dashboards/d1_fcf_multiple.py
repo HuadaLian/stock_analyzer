@@ -21,8 +21,9 @@ from db.repository import (
     get_dcf_metrics,
 )
 from db.schema import get_conn
-from dashboards.cache import get_all_tickers_cached
+from core.symbol_router import apply_global_selection
 from dashboards.market_features import get_market_features
+from dashboards.symbol_registry import build_symbol_registry, find_registry_row
 from etl.loader import upsert_ohlcv_daily, upsert_ohlcv_ema, upsert_fmp_dcf_history
 from etl.sources.fmp_dcf import fetch_fmp_dcf_history
 from etl.sources.fmp import fetch_profile, fetch_ohlcv, fetch_fx_to_usd
@@ -677,9 +678,13 @@ def _refresh_latest_fmp_data(ticker: str) -> tuple[bool, str]:
             # Get all historical data for EMA calculation
             df_hist = get_ohlcv(ticker_upper)
             if not df_hist.empty:
+                # Normalize date dtype before concat/sort to avoid str vs Timestamp comparison crash.
+                df_hist["date"] = pd.to_datetime(df_hist["date"], errors="coerce")
+                df_new["date"] = pd.to_datetime(df_new["date"], errors="coerce")
+                df_new = df_new.dropna(subset=["date"])
                 # Combine historical + new
                 df_combined = pd.concat([df_hist, df_new], ignore_index=True)
-                df_combined = df_combined.sort_values("date").reset_index(drop=True)
+                df_combined = df_combined.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
                 
                 # Calculate EMA
                 df_combined["ema10"] = df_combined["adj_close"].ewm(span=10, adjust=False).mean()
@@ -1214,21 +1219,60 @@ def _render_metrics_panel(
         st.markdown(metrics_html, unsafe_allow_html=True)
 
 
+def _d1_row_id(market: str, ticker: str) -> str:
+    return f"{(market or 'US').strip().upper()}\t{(ticker or '').strip().upper()}"
+
+
+def _parse_d1_row_id(row_id: str) -> tuple[str, str]:
+    parts = (row_id or "").split("\t", 1)
+    if len(parts) != 2:
+        return "US", ""
+    return parts[0].strip().upper(), parts[1].strip().upper()
+
+
 def render_d1_stock(market: str = "US", ticker_override: str | None = None) -> str:
     st.subheader("D1: 价格图线")
     market_u = (market or "US").strip().upper()
     features = get_market_features(market_u)
-    ticker_df = get_all_tickers_cached(market=market_u)
-    ticker_options = sorted(ticker_df["ticker"].dropna().astype(str).unique().tolist()) if not ticker_df.empty else []
     default_ticker = str(
         ticker_override
         or st.session_state.get(f"d1_{market_u.lower()}_ticker")
         or ("NVDA" if market_u == "US" else "")
     ).strip().upper()
-    if default_ticker and default_ticker not in ticker_options:
-        ticker_options = [default_ticker] + ticker_options
-    if not ticker_options:
-        ticker_options = [default_ticker or "NVDA"]
+
+    registry_rows: list[dict] = list(build_symbol_registry())
+    if default_ticker and find_registry_row(registry_rows, market_u, default_ticker) is None:
+        registry_rows.insert(
+            0,
+            {
+                "ticker": default_ticker,
+                "market": market_u,
+                "name": "",
+                "label": f"{default_ticker} [{market_u}]",
+            },
+        )
+
+    option_ids = [_d1_row_id(r["market"], r["ticker"]) for r in registry_rows]
+    label_for = {_d1_row_id(r["market"], r["ticker"]): r["label"] for r in registry_rows}
+    default_id = _d1_row_id(market_u, default_ticker)
+    if default_id not in label_for:
+        registry_rows.insert(
+            0,
+            {
+                "ticker": default_ticker,
+                "market": market_u,
+                "name": "",
+                "label": f"{default_ticker} [{market_u}]",
+            },
+        )
+        option_ids = [_d1_row_id(r["market"], r["ticker"]) for r in registry_rows]
+        label_for = {_d1_row_id(r["market"], r["ticker"]): r["label"] for r in registry_rows}
+        default_id = _d1_row_id(market_u, default_ticker)
+
+    parent_target = f"{market_u}|{default_ticker}"
+    if st.session_state.get("_d1_parent_target") != parent_target:
+        st.session_state["_d1_parent_target"] = parent_target
+        st.session_state["d1_unified_ticker_select"] = default_id
 
     # Main layout: chart ~70%, right panel ~30%
     col_left, col_right = st.columns([7, 3], gap="medium")
@@ -1237,14 +1281,20 @@ def render_d1_stock(market: str = "US", ticker_override: str | None = None) -> s
         # Same row: ticker + start_date + refresh, vertically centered
         c_tk, c_dt, c_rf = st.columns([1.4, 1.1, 0.7], gap="small", vertical_alignment="center")
         with c_tk:
-            ticker = st.selectbox(
+            st.selectbox(
                 "Ticker",
-                options=ticker_options,
-                index=ticker_options.index(default_ticker) if default_ticker in ticker_options else 0,
-                key=f"d1_{market_u.lower()}_ticker_select",
-                help="输入字符可搜索股票代码",
+                options=option_ids,
+                key="d1_unified_ticker_select",
+                format_func=lambda rid, lf=label_for: lf.get(rid, rid),
+                help="全市场代码（US/CN/HK）；输入字符可筛选",
                 label_visibility="collapsed",
             )
+            sel_id = st.session_state.get("d1_unified_ticker_select", default_id)
+            sm, tk = _parse_d1_row_id(str(sel_id))
+            if sm and tk and (sm != market_u or tk != default_ticker):
+                apply_global_selection(st.session_state, sm, tk)
+                st.rerun()
+            ticker = tk
         st.session_state[f"d1_{market_u.lower()}_ticker"] = ticker
         with c_dt:
             start_date = st.date_input(
@@ -1254,9 +1304,7 @@ def render_d1_stock(market: str = "US", ticker_override: str | None = None) -> s
                 label_visibility="collapsed",
             )
         with c_rf:
-            do_refresh = False
-            if market_u == "US":
-                do_refresh = st.button("刷新", key=f"refresh_top_{market_u}_{ticker}", type="secondary", width="stretch")
+            do_refresh = st.button("刷新", key=f"refresh_top_{market_u}_{ticker}", type="secondary", width="stretch")
 
     if do_refresh:
         success, msg = _refresh_latest_fmp_data(ticker)
