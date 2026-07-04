@@ -51,7 +51,8 @@ def get_fundamentals(ticker: str, *, conn=None) -> pd.DataFrame:
         return c.execute("""
             SELECT fiscal_year, fiscal_end_date, filing_date,
                    fcf, fcf_per_share, shares_out, currency,
-                   reporting_currency, fx_to_usd
+                   reporting_currency, fx_to_usd,
+                   fcf_quality, fcf_scale_divisor, fcf_fmp_unit_notes
             FROM fundamentals_annual
             WHERE ticker = ?
             ORDER BY fiscal_year DESC
@@ -122,6 +123,23 @@ def get_company(ticker: str, *, conn=None) -> dict | None:
         "currency": row[5] or "USD",
         "market_cap": float(mcap_row[0]) if mcap_row and mcap_row[0] else None,
     }
+
+
+def pick_random_company_ticker(market: str = "US", *, conn=None) -> str | None:
+    """从 ``companies`` 中按 ``market`` 随机取一只 ticker（无额外条件；单次 SQL）。"""
+    mkt = (market or "US").strip().upper()
+    sql = """
+        SELECT trim(c.ticker)
+        FROM companies c
+        WHERE upper(trim(coalesce(c.market, ''))) = ?
+        ORDER BY random()
+        LIMIT 1
+    """
+    with _resolve(conn) as c:
+        row = c.execute(sql, [mkt]).fetchone()
+    if not row or not row[0]:
+        return None
+    return str(row[0]).strip().upper()
 
 
 def get_all_tickers(market: str | None = None, *, conn=None) -> pd.DataFrame:

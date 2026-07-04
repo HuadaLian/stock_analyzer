@@ -37,7 +37,7 @@ def _ohlcv_row(date: str = "2024-01-02", close: float = 500.0) -> dict:
 
 
 def _fundamental_row(year: int = 2024, fcf: float = 60_922.0) -> dict:
-    """与 _FCF_COLS 一致的 29 列。"""
+    """与 _FCF_COLS 一致的列集合（含 FCF 质量字段）。"""
     base = {col: None for col in [
         "revenue", "revenue_per_share", "gross_profit", "gross_margin",
         "operating_income", "operating_margin", "net_income", "profit_margin",
@@ -53,6 +53,7 @@ def _fundamental_row(year: int = 2024, fcf: float = 60_922.0) -> dict:
         "reporting_currency": "USD", "fx_to_usd": 1.0,
         "fcf": fcf, "fcf_per_share": fcf / 24_500.0,
         "shares_out": 24_400.0, "source": "fmp",
+        "fcf_quality": "ok", "fcf_scale_divisor": 1, "fcf_fmp_unit_notes": None,
     })
     return base
 

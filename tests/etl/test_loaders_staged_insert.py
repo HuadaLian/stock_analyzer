@@ -128,6 +128,7 @@ def _fcf_row(ticker: str, year: int, **overrides) -> dict:
         "filing_date": dt.date(year + 1, 3, 1),
         "currency": "USD", "reporting_currency": "USD", "fx_to_usd": 1.0,
         "fcf": 100.0, "fcf_per_share": 1.0, "shares_out": 100.0, "source": "fmp",
+        "fcf_quality": "ok", "fcf_scale_divisor": 1, "fcf_fmp_unit_notes": None,
         "revenue": None, "revenue_per_share": None,
         "gross_profit": None, "gross_margin": None,
         "operating_income": None, "operating_margin": None,

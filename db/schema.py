@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS companies (
     exchange            VARCHAR,        -- short, e.g. 'NASDAQ', 'NYSE'
     exchange_full_name  VARCHAR,        -- e.g. 'NASDAQ Global Select'
     country             VARCHAR,        -- issuer / listing country
+    cik                 VARCHAR,        -- SEC CIK (zero-padded), FMP profile
+    is_actively_trading BOOLEAN,        -- FMP isActivelyTrading; NULL = unknown
     sector              VARCHAR,
     industry            VARCHAR,
     currency            VARCHAR,        -- reporting currency, e.g. 'USD'
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS ohlcv_daily (
     volume      BIGINT,
     adj_close   DOUBLE,     -- forward-adjusted close (前复权), used for DCF overlay
     market_cap  DOUBLE,     -- adj_close × shares_out (millions), pre-computed by ETL
+    market_cap_usd DOUBLE,  -- market_cap converted to USD (millions) with latest FX
     ema10       DOUBLE,     -- 10-day EMA of adj_close, pre-computed by ETL
     ema250      DOUBLE,     -- 250-day EMA of adj_close, pre-computed by ETL
     PRIMARY KEY (ticker, date)
@@ -131,8 +134,11 @@ CREATE TABLE IF NOT EXISTS fundamentals_annual (
     depreciation            DOUBLE,     -- Depreciation Expense (millions)
     effective_tax_rate      DOUBLE,     -- ratio 0-1
     -- Cash flow (source: /cash-flow-statement?period=annual)
-    fcf                     DOUBLE,     -- Free Cash Flow (millions)
-    fcf_per_share           DOUBLE,     -- Free Cash Flow per Share
+    fcf                     DOUBLE,     -- Free Cash Flow (millions); NULL if flagged_magnitude cleared
+    fcf_per_share           DOUBLE,     -- FCF/share USD; NULL if flagged_magnitude cleared
+    fcf_quality             VARCHAR,    -- ok | scaled_* | currency_shift | flagged_magnitude (suspect; see notes)
+    fcf_scale_divisor       INTEGER DEFAULT 1,  -- FMP native units correction (1 / 100 / 1000)
+    fcf_fmp_unit_notes      VARCHAR,    -- hints; if flagged: may include suppressed_raw_* + values_cleared_not_trusted
     dividend_per_share      DOUBLE,     -- Dividend per Share
     -- Balance sheet (source: /balance-sheet-statement?period=annual)
     total_equity            DOUBLE,     -- Total Equity (millions)
@@ -337,8 +343,14 @@ _MIGRATIONS = [
     "ALTER TABLE dcf_metrics ADD COLUMN IF NOT EXISTS invest_potential DOUBLE",
     "ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS ema10 DOUBLE",
     "ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS ema250 DOUBLE",
+    "ALTER TABLE ohlcv_daily ADD COLUMN IF NOT EXISTS market_cap_usd DOUBLE",
+    "ALTER TABLE fundamentals_annual ADD COLUMN IF NOT EXISTS fcf_quality VARCHAR",
+    "ALTER TABLE fundamentals_annual ADD COLUMN IF NOT EXISTS fcf_scale_divisor INTEGER DEFAULT 1",
+    "ALTER TABLE fundamentals_annual ADD COLUMN IF NOT EXISTS fcf_fmp_unit_notes VARCHAR",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS country VARCHAR",
     "ALTER TABLE companies ADD COLUMN IF NOT EXISTS exchange_full_name VARCHAR",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS cik VARCHAR",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS is_actively_trading BOOLEAN",
     """
     CREATE TABLE IF NOT EXISTS etl_us_bulk_state (
         ticker      VARCHAR PRIMARY KEY,

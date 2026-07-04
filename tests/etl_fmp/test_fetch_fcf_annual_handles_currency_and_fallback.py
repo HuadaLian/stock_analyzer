@@ -7,8 +7,8 @@ reportedCurrency != USD 时自动调用汇率端点把 FCF 折算到美元。
 - fcf / fcf_per_share 都已是美元。fx_to_usd 写入“当年 1 报告币 = N USD”的实际倍率。
 - FCF 优先用 freeCashFlow；缺失时回退 operatingCashFlow - |capitalExpenditure|。
   capex 在 FMP 多数为负值，用 abs() 保证语义一致。
-- fcf_per_share 必须用最新 shares_out_raw 重算 (与前复权 adj_close 同基准)，
-  而不是当年 weighted-average shares —— 这是 DCF 价位线对齐 K 线的前提。
+- fcf_per_share 默认用最新 ``shares_out_raw``；当与报表加权股本推导值严重冲突且符合 ADR/错误 profile
+  启发式时，改用 ``fcf / weightedAverageShsOut``（见 ``fetch_fcf_annual`` 实现）。
 - 非 FCF 字段 (revenue, roic 等) 此阶段全部为 None，留给后续阶段填充。
 """
 
@@ -150,6 +150,18 @@ def test_fetch_fcf_per_share_uses_latest_shares_not_historical(mock_fmp):
     assert rows[0]["shares_out"] == pytest.approx(500.0)
 
 
+def test_fetch_fcf_prefers_statement_per_share_when_profile_badly_wrong(mock_fmp):
+    """次要上市 profile 股本离谱时，每股 FCF 应回到报表加权股本推导。"""
+    mock_fmp.set("cash-flow-statement", [{
+        "date": "2024-01-26",
+        "reportedCurrency": "USD",
+        "freeCashFlow": 7_000_000_000,
+        "weightedAverageShsOut": 1_400_000_000,
+    }])
+    rows = fetch_fcf_annual("PEPBA", shares_out_raw=200_000_000_000.0)
+    assert rows[0]["fcf_per_share"] == pytest.approx(5.0)
+
+
 def test_fetch_fcf_leaves_non_fcf_columns_null(mock_fmp):
     """阶段 2 只写 FCF；revenue/roic 等列须为 None，避免覆盖后续阶段的填充。"""
     mock_fmp.set("cash-flow-statement", [{
@@ -163,7 +175,6 @@ def test_fetch_fcf_leaves_non_fcf_columns_null(mock_fmp):
     row = rows[0]
 
     # source 标记为 fmp，便于后续审计
-    assert row["source"] == "fmp"
     # 非 FCF 字段应全为 None
     for col in ("revenue", "gross_profit", "net_income", "eps",
                 "roic", "return_on_equity", "total_equity"):

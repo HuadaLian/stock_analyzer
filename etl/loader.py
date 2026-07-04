@@ -74,23 +74,30 @@ def upsert_company(conn: duckdb.DuckDBPyConnection, data: dict) -> None:
     conn.execute("""
         INSERT INTO companies
             (ticker, market, name, exchange, exchange_full_name, country,
+             cik, is_actively_trading,
              sector, industry, currency, description, shares_out, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
         ON CONFLICT (ticker) DO UPDATE SET
             market               = excluded.market,
             name                 = excluded.name,
             exchange             = excluded.exchange,
             exchange_full_name   = excluded.exchange_full_name,
             country              = excluded.country,
-            sector               = excluded.sector,
-            industry             = excluded.industry,
-            currency             = excluded.currency,
-            description          = excluded.description,
-            shares_out           = excluded.shares_out,
-            updated_at           = excluded.updated_at
+            cik                 = CASE WHEN excluded.cik IS NULL OR trim(cast(excluded.cik AS VARCHAR)) = ''
+                                     THEN companies.cik ELSE excluded.cik END,
+            is_actively_trading = CASE WHEN excluded.is_actively_trading IS NULL
+                                     THEN companies.is_actively_trading ELSE excluded.is_actively_trading END,
+            sector                 = excluded.sector,
+            industry               = excluded.industry,
+            currency               = excluded.currency,
+            description            = excluded.description,
+            shares_out             = excluded.shares_out,
+            updated_at             = excluded.updated_at
     """, [
         data["ticker"], data["market"], data["name"], data.get("exchange"),
         data.get("exchange_full_name"), data.get("country"),
+        data.get("cik"),
+        data.get("is_actively_trading"),
         data["sector"], data["industry"], data["currency"], data["description"],
         data["shares_out"],
     ])
@@ -101,7 +108,7 @@ def upsert_company(conn: duckdb.DuckDBPyConnection, data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 _OHLCV_BASE_COLS = ["ticker", "date", "open", "high", "low",
-                    "close", "volume", "adj_close", "market_cap"]
+                    "close", "volume", "adj_close", "market_cap", "market_cap_usd"]
 
 
 def upsert_ohlcv_daily(conn: duckdb.DuckDBPyConnection, rows: list[dict]) -> None:
@@ -120,7 +127,8 @@ def upsert_ohlcv_daily(conn: duckdb.DuckDBPyConnection, rows: list[dict]) -> Non
             close      = excluded.close,
             volume     = excluded.volume,
             adj_close  = excluded.adj_close,
-            market_cap = excluded.market_cap
+            market_cap = excluded.market_cap,
+            market_cap_usd = excluded.market_cap_usd
         """,
         stage_prefix="ohlcv",
     )
@@ -156,6 +164,7 @@ _FCF_COLS = [
     "ticker", "fiscal_year", "fiscal_end_date", "filing_date", "currency",
     "reporting_currency", "fx_to_usd",
     "fcf", "fcf_per_share", "shares_out", "source",
+    "fcf_quality", "fcf_scale_divisor", "fcf_fmp_unit_notes",
     "revenue", "revenue_per_share", "gross_profit", "gross_margin",
     "operating_income", "operating_margin", "net_income", "profit_margin",
     "eps", "depreciation", "effective_tax_rate", "dividend_per_share",
@@ -170,11 +179,19 @@ def upsert_fundamentals_annual(
 ) -> None:
     # Note: only FCF/currency columns updated on conflict; other columns untouched
     # so a later income-statement upsert can fill them without being overwritten.
+    norm: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        d.setdefault("fcf_quality", "ok")
+        d.setdefault("fcf_scale_divisor", 1)
+        if "fcf_fmp_unit_notes" not in d:
+            d["fcf_fmp_unit_notes"] = None
+        norm.append(d)
     _bulk_upsert(
         conn,
         table="fundamentals_annual",
         cols=_FCF_COLS,
-        rows=rows,
+        rows=norm,
         conflict="ticker, fiscal_year",
         update_clause="""
             fiscal_end_date    = excluded.fiscal_end_date,
@@ -185,7 +202,10 @@ def upsert_fundamentals_annual(
             fcf                = excluded.fcf,
             fcf_per_share      = excluded.fcf_per_share,
             shares_out         = excluded.shares_out,
-            source             = excluded.source
+            source             = excluded.source,
+            fcf_quality        = excluded.fcf_quality,
+            fcf_scale_divisor  = excluded.fcf_scale_divisor,
+            fcf_fmp_unit_notes = excluded.fcf_fmp_unit_notes
         """,
         stage_prefix="fcf",
     )

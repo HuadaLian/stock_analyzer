@@ -32,6 +32,7 @@ def run_cn_ticker(code: str) -> dict:
                 "volume": int(float(r["volume"])) if r["volume"] is not None else 0,
                 "adj_close": float(r["adj_close"]),
                 "market_cap": None,
+                "market_cap_usd": None,
             }
         )
 

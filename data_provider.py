@@ -4,6 +4,12 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
+from db.fcf_quality import (
+    apply_fcf_native_adjustments,
+    build_fcf_work_row,
+    suppressed_flagged_fcf_notes,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  FMP (Financial Modeling Prep) helpers
@@ -115,7 +121,7 @@ def _fmp_fcf_data(ticker: str, shares_outstanding: float = None) -> dict:
     fmp_currency = (data[0].get("reportedCurrency") or "USD").upper()
     result["fmp_currency"] = fmp_currency
 
-    rows = []
+    raw_rows: list[dict] = []
     for entry in data:
         date_str = entry.get("date", "")
         if not date_str:
@@ -135,20 +141,63 @@ def _fmp_fcf_data(ticker: str, shares_outstanding: float = None) -> dict:
         else:
             fcf_val = None
 
+        row_rep = (entry.get("reportedCurrency") or fmp_currency or "USD").upper()
+        raw_rows.append({
+            "_entry": entry,
+            "年份": ts,
+            "OCF": ocf_val,
+            "CapEx": capex_val,
+            "FCF_native": fcf_val,
+            "row_reporting": row_rep,
+        })
+
+    if not raw_rows:
+        return result
+
+    chrono = sorted(raw_rows, key=lambda x: x["年份"])
+    work = [
+        build_fcf_work_row(
+            fiscal_year=int(r["年份"].year),
+            fcf_native=r["FCF_native"],
+            ocf_native=r["OCF"],
+            reporting_currency=str(r["row_reporting"]),
+            fx_to_usd=1.0,
+            entry=r["_entry"],
+        )
+        for r in chrono
+    ]
+    adj_meta = apply_fcf_native_adjustments(work)
+
+    rows = []
+    for r, meta in zip(chrono, adj_meta):
+        fcf_adj = meta["fcf_native_adjusted"]
+        fcf_val = float(fcf_adj) if fcf_adj is not None else None
         fcf_ps = None
         if fcf_val is not None and shares_outstanding and shares_outstanding > 0:
             fcf_ps = fcf_val / shares_outstanding
-
+        unit_note = meta.get("fcf_fmp_unit_notes")
+        quality = str(meta.get("quality") or "ok")
+        if quality == "flagged_magnitude":
+            fcf_m_note = None
+            if fcf_val is not None and np.isfinite(fcf_val):
+                fcf_m_note = float(fcf_val) / 1_000_000.0
+            unit_note = suppressed_flagged_fcf_notes(
+                unit_note,
+                fcf_millions=fcf_m_note,
+                fcf_per_share=fcf_ps,
+            )
+            fcf_val = None
+            fcf_ps = None
         rows.append({
-            "年份":  ts,
-            "OCF":   ocf_val,
-            "CapEx": capex_val,
-            "FCF":   fcf_val,
+            "年份": r["年份"],
+            "OCF": r["OCF"],
+            "CapEx": r["CapEx"],
+            "FCF": fcf_val,
             "每股FCF": fcf_ps,
+            "FCF质量": quality,
+            "FCF缩放": int(meta["scale_divisor"]),
+            "FMP单位注记": unit_note,
         })
-
-    if not rows:
-        return result
 
     sorted_rows = sorted(rows, key=lambda x: x["年份"], reverse=True)
     for i, row in enumerate(sorted_rows):
@@ -1023,6 +1072,23 @@ def get_us_data(ticker, years=15):
     except Exception as _fmp_err:
         fmp_status = f"FMP: 获取失败 — {_fmp_err}"
 
+    anomaly_years: set[int] = set()
+    try:
+        ft = fin.get("fcf_table")
+        if ft is not None and not ft.empty and "FCF质量" in ft.columns:
+            for _, row in ft.iterrows():
+                q = str(row.get("FCF质量") or "ok").strip().lower()
+                if q in ("", "ok", "none", "nan"):
+                    continue
+                try:
+                    yraw = row.get("年份")
+                    ystr = str(yraw)[:10] if yraw is not None else ""
+                    anomaly_years.add(int(ystr[:4]))
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+
     # --- Analyst ratings + price target from FMP -----------------------
     analyst_data = None
     try:
@@ -1057,6 +1123,7 @@ def get_us_data(ticker, years=15):
         "analyst_data": analyst_data,
         "fmp_dcf_value": fmp_dcf_value,
         "fmp_dcf_df": fmp_dcf_df,
+        "fcf_anomaly_fiscal_years": anomaly_years,
         **{k: v for k, v in fin.items() if k not in ("market_cap", "currency", "shares_outstanding")},
     }
 

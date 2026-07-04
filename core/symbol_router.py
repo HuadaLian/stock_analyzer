@@ -9,8 +9,8 @@ def parse_global_symbol(raw: str) -> tuple[str, str]:
     if not s:
         return "US", ""
 
-    # CN forms: 600519 / 600519.SH / 000001.SZ
-    if s.endswith(".SH") or s.endswith(".SZ") or s.endswith(".BJ"):
+    # CN forms: 600519 / 600519.SH / 000001.SZ / 603568.SS (雅虎沪市后缀)
+    if s.endswith((".SH", ".SZ", ".BJ", ".SS")):
         core = s.split(".", 1)[0]
         if core.isdigit():
             suffix = s.split(".", 1)[1]
@@ -36,9 +36,22 @@ def parse_global_symbol(raw: str) -> tuple[str, str]:
 
 
 def apply_global_selection(session_state, market: str, ticker: str) -> None:
-    """Apply global selection into canonical keys and market-specific keys."""
-    m = (market or "US").strip().upper()
+    """Apply global selection into canonical keys and market-specific keys.
+
+    FMP 等链路可能写入 ``GLOBAL``；个股分析页的 D1–D3 仅接受 US/CN/HK，
+    故在此收敛到三市场之一（后缀优先，否则归为 US）。
+    """
     t = (ticker or "").strip().upper()
+    m_raw = (market or "US").strip().upper()
+    if m_raw in ("US", "CN", "HK"):
+        m = m_raw
+    elif t.endswith((".SH", ".SZ", ".BJ", ".SS")):
+        m = "CN"
+    elif t.endswith(".HK"):
+        m = "HK"
+    else:
+        m = "US"
+
     session_state["global_selected_market"] = m
     session_state["global_selected_ticker"] = t
     session_state["active_market"] = m

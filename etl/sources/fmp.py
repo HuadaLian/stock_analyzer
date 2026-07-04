@@ -13,8 +13,14 @@ from __future__ import annotations
 import logging
 import os
 import requests
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+
+from db.fcf_quality import (
+    apply_fcf_native_adjustments,
+    build_fcf_work_row,
+    suppressed_flagged_fcf_notes,
+)
 
 _FMP_BASE = "https://financialmodelingprep.com/stable"
 ANNUAL_HISTORY_LIMIT = 15
@@ -174,6 +180,19 @@ def fetch_profile(ticker: str) -> dict:
     country = (p.get("country") or "").strip() or None
     market = infer_market(ticker, ex_short, country)
 
+    raw_cik = p.get("cik")
+    cik_str: str | None = None
+    if raw_cik is not None and str(raw_cik).strip():
+        digits = "".join(ch for ch in str(raw_cik).strip() if ch.isdigit())
+        if digits:
+            cik_str = digits.zfill(10)
+
+    is_actively_trading: bool | None
+    if "isActivelyTrading" in p and p.get("isActivelyTrading") is not None:
+        is_actively_trading = bool(p.get("isActivelyTrading"))
+    else:
+        is_actively_trading = None
+
     return {
         "ticker":      ticker.upper(),
         "market":      market,
@@ -181,6 +200,8 @@ def fetch_profile(ticker: str) -> dict:
         "exchange":    ex_short,
         "exchange_full_name": ex_full,
         "country":     country,
+        "cik":         cik_str,
+        "is_actively_trading": is_actively_trading,
         "sector":      p.get("sector"),
         "industry":    p.get("industry"),
         "currency":    (p.get("currency") or "USD").upper(),
@@ -201,6 +222,7 @@ def fetch_profile(ticker: str) -> dict:
 def fetch_ohlcv(
     ticker: str,
     shares_out_raw: float | None = None,
+    market_cap_fx_to_usd: float | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> list[dict]:
@@ -212,6 +234,7 @@ def fetch_ohlcv(
     them by the same ratio (adjClose / close) to put all prices on the same basis.
 
     market_cap (millions) = adj_close × (shares_out_raw / 1_000_000)
+    market_cap_usd (millions) = market_cap × market_cap_fx_to_usd
     """
     params = {"symbol": ticker}
     if date_from:
@@ -253,6 +276,9 @@ def fetch_ohlcv(
         mkt_cap = None
         if shares_out_raw and adj_close:
             mkt_cap = adj_close * shares_out_raw / 1_000_000
+        mkt_cap_usd = None
+        if mkt_cap is not None and market_cap_fx_to_usd and market_cap_fx_to_usd > 0:
+            mkt_cap_usd = mkt_cap * float(market_cap_fx_to_usd)
 
         rows.append({
             "ticker":     ticker.upper(),
@@ -264,6 +290,7 @@ def fetch_ohlcv(
             "volume":     int(row.get("volume") or 0),
             "adj_close":  adj_close,
             "market_cap": mkt_cap,
+            "market_cap_usd": mkt_cap_usd,
         })
 
     return rows
@@ -316,6 +343,19 @@ def fetch_fx_to_usd(currency: str, date_from: str, date_to: str) -> dict[str, fl
     return fx_dict
 
 
+def fetch_latest_fx_to_usd(currency: str) -> float:
+    """Return latest available FX where 1 {currency} = N USD."""
+    ccy = (currency or "USD").upper()
+    if ccy == "USD":
+        return 1.0
+    end = date.today().isoformat()
+    start = (date.today() - timedelta(days=14)).isoformat()
+    fx = fetch_fx_to_usd(ccy, start, end)
+    if not fx:
+        raise RuntimeError(f"no FX history for {ccy}/USD in {start}..{end}")
+    return float(fx[max(fx.keys())])
+
+
 def _rate_on_or_before(fx_dict: dict[str, float], target_date: str) -> float:
     """Return the FX rate effective on `target_date`, walking back to the closest prior date."""
     if not fx_dict:
@@ -346,8 +386,9 @@ def fetch_fcf_annual(
     - fx_to_usd: rate applied on each fiscal_end_date (1.0 when already USD)
     - fcf / fcf_per_share: USD-converted
 
-    Per-share FCF uses the LATEST shares_out_raw (not historical), so per-share
-    values share the same forward-adjusted price basis as adj_close.
+    Per-share FCF: 默认仍用 profile 的 ``shares_out_raw``（与前复权 adj_close 同基准、拆股年对齐）；
+    当报表加权股本与 profile 严重不一致且符合「错误 profile / ADR 次要上市」启发式时，
+    改用 ``fcf_millions / weightedAverageShsOut``（与 ``shares_out`` 列同源）。
 
     Values stored:
         fcf          in millions USD
@@ -380,48 +421,141 @@ def fetch_fcf_annual(
                 reporting, min(report_dates), max(report_dates)
             )
 
-    rows = []
+    parsed: list[dict] = []
     for entry in data:
         date_str = entry.get("date", "")
         if not date_str:
             continue
 
-        # FCF = freeCashFlow if available, else operatingCashFlow - |capitalExpenditure|
         fcf_raw = entry.get("freeCashFlow")
         if fcf_raw is None:
-            ocf   = entry.get("operatingCashFlow")
+            ocf = entry.get("operatingCashFlow")
             capex = entry.get("capitalExpenditure")
             if ocf is not None and capex is not None:
                 fcf_raw = float(ocf) - abs(float(capex))
         fcf_native = float(fcf_raw) if fcf_raw is not None else None
 
-        # Currency conversion: rate is 1 reporting = N USD on fiscal_end_date
+        ocf_native = None
+        if entry.get("operatingCashFlow") is not None:
+            try:
+                ocf_native = float(entry.get("operatingCashFlow"))
+            except (TypeError, ValueError):
+                ocf_native = None
+
+        fy = int(date_str[:4])
+        row_rep = (entry.get("reportedCurrency") or reporting or "USD").upper()
         rate = _rate_on_or_before(fx_by_date, date_str[:10]) if reporting != "USD" else 1.0
-        fcf_usd = fcf_native * rate if fcf_native is not None else None
 
-        # Per-share FCF in USD using LATEST shares (same basis as adj_close)
-        fcf_per_share = None
-        if fcf_usd is not None and shares_out_raw and shares_out_raw > 0:
-            fcf_per_share = fcf_usd / shares_out_raw
-
-        # Weighted avg shares from FMP (stored in millions)
         wa_shares_raw = entry.get("weightedAverageShsOut")
         shares_out_hist = float(wa_shares_raw) / 1_000_000 if wa_shares_raw else None
 
+        parsed.append({
+            "_entry": entry,
+            "fiscal_year": fy,
+            "fiscal_end_date": date_str[:10],
+            "filing_date": (entry.get("filingDate") or entry.get("fillingDate") or "")[:10] or None,
+            "row_reporting": row_rep,
+            "fx_to_usd": rate,
+            "fcf_native": fcf_native,
+            "ocf_native": ocf_native,
+            "shares_out_hist": shares_out_hist,
+        })
+
+    parsed.sort(key=lambda r: r["fiscal_year"])
+
+    work = [
+        build_fcf_work_row(
+            fiscal_year=int(p["fiscal_year"]),
+            fcf_native=p["fcf_native"],
+            ocf_native=p["ocf_native"],
+            reporting_currency=str(p["row_reporting"]),
+            fx_to_usd=float(p["fx_to_usd"]),
+            entry=p["_entry"],
+        )
+        for p in parsed
+    ]
+    adj_meta = apply_fcf_native_adjustments(work)
+
+    rows: list[dict] = []
+    for p, meta in zip(parsed, adj_meta):
+        fcf_native_adj = meta["fcf_native_adjusted"]
+        fcf_native_adj_f = float(fcf_native_adj) if fcf_native_adj is not None else None
+        rate = float(p["fx_to_usd"])
+        fcf_usd = fcf_native_adj_f * rate if fcf_native_adj_f is not None else None
+
+        fcf_millions = fcf_usd / 1_000_000 if fcf_usd is not None else None
+        sh_hist = p.get("shares_out_hist")
+        fcf_ps_stmt: float | None = None
+        if fcf_millions is not None and sh_hist is not None:
+            try:
+                shf = float(sh_hist)
+            except (TypeError, ValueError):
+                shf = 0.0
+            if shf > 0:
+                fcf_ps_stmt = float(fcf_millions) / shf
+                if not (1e-9 < fcf_ps_stmt < 500.0):
+                    fcf_ps_stmt = None
+
+        fcf_ps_profile: float | None = None
+        if fcf_usd is not None and shares_out_raw and float(shares_out_raw) > 0:
+            fcf_ps_profile = float(fcf_usd) / float(shares_out_raw)
+
+        fcf_per_share: float | None = None
+        if fcf_ps_stmt is not None and fcf_ps_profile is not None:
+            rh = None
+            if shares_out_raw and float(shares_out_raw) > 0 and sh_hist is not None:
+                try:
+                    sh_prof_m = float(shares_out_raw) / 1_000_000.0
+                    if sh_prof_m > 0:
+                        rh = float(sh_hist) / sh_prof_m
+                except (TypeError, ValueError):
+                    rh = None
+            adr_broken = (
+                fcf_ps_profile < 0.25
+                and fcf_ps_stmt > 2.0
+                and fcf_millions is not None
+                and float(fcf_millions) > 1_500.0
+                and (fcf_ps_stmt / max(fcf_ps_profile, 1e-12)) > 8.0
+            )
+            if rh is not None and rh < 0.5 and adr_broken:
+                fcf_per_share = fcf_ps_stmt
+            elif rh is not None and rh < 0.5:
+                fcf_per_share = fcf_ps_profile
+            elif 0.5 <= (fcf_ps_stmt / max(fcf_ps_profile, 1e-12)) <= 2.0:
+                fcf_per_share = fcf_ps_profile
+            else:
+                fcf_per_share = fcf_ps_stmt
+        elif fcf_ps_stmt is not None:
+            fcf_per_share = fcf_ps_stmt
+        else:
+            fcf_per_share = fcf_ps_profile
+
+        quality = str(meta["quality"])
+        unit_notes = meta.get("fcf_fmp_unit_notes")
+        if quality == "flagged_magnitude":
+            unit_notes = suppressed_flagged_fcf_notes(
+                unit_notes,
+                fcf_millions=fcf_millions,
+                fcf_per_share=fcf_per_share,
+            )
+            fcf_millions = None
+            fcf_per_share = None
+
         rows.append({
             "ticker":             ticker.upper(),
-            "fiscal_year":        int(date_str[:4]),
-            "fiscal_end_date":    date_str[:10],
-            "filing_date":        (entry.get("filingDate") or entry.get("fillingDate") or "")[:10] or None,
+            "fiscal_year":        int(p["fiscal_year"]),
+            "fiscal_end_date":    p["fiscal_end_date"],
+            "filing_date":        p["filing_date"],
             "currency":           "USD",
-            "reporting_currency": reporting,
+            "reporting_currency": str(p["row_reporting"]),
             "fx_to_usd":          rate,
-            # FCF fields (Phase 2) — stored in USD millions
-            "fcf":                fcf_usd / 1_000_000 if fcf_usd is not None else None,
+            "fcf":                fcf_millions,
             "fcf_per_share":      fcf_per_share,
-            "shares_out":         shares_out_hist,
+            "shares_out":         p["shares_out_hist"],
             "source":             "fmp",
-            # All other fundamentals_annual columns → None (filled in later phases)
+            "fcf_quality":        quality,
+            "fcf_scale_divisor":  int(meta["scale_divisor"]),
+            "fcf_fmp_unit_notes": unit_notes,
             "revenue":                   None,
             "revenue_per_share":         None,
             "gross_profit":              None,
@@ -444,6 +578,7 @@ def fetch_fcf_annual(
             "return_on_equity":          None,
         })
 
+    rows.sort(key=lambda r: r["fiscal_year"], reverse=True)
     return rows
 
 

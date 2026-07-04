@@ -14,6 +14,20 @@ from gemini_chat import (
 )
 
 
+def _kline_y_axis_range(day_low_min, day_high_max):
+    """K 线主图 Y 轴：仅用日 K 价格——下限为全日最低价，上限为日 K 最高价×2（不含 EMA/DCF/FMP）。"""
+    try:
+        lo = float(day_low_min)
+        hi = float(day_high_max)
+    except (TypeError, ValueError):
+        return 0.0, 1.0
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return 0.0, 1.0
+    y_bottom = lo
+    y_top = max(hi * 2.0, lo + 1e-9)
+    return y_bottom, y_top
+
+
 class MarketAnalyzer:
     """Base class for market-specific stock analysis.
 
@@ -701,6 +715,8 @@ class MarketAnalyzer:
             dcf_df = dcf_df.copy()
             dcf_df["plot_date"] = dcf_df["date"].apply(_align_to_trade_day)
 
+        anomaly_years = data.get("fcf_anomaly_fiscal_years") or set()
+
         fig = go.Figure()
 
         # Candlestick
@@ -738,6 +754,24 @@ class MarketAnalyzer:
                     marker=dict(size=10, symbol="diamond", line=dict(width=1, color="white")),
                     connectgaps=True,
                 ))
+
+            if anomaly_years and len(dcf_df) > 1:
+                main = dcf_df.iloc[:-1]
+                mk = main[main["date"].dt.year.isin(anomaly_years)]
+                if not mk.empty:
+                    fig.add_trace(go.Scatter(
+                        x=mk["plot_date"],
+                        y=mk["dcf_24x"],
+                        name="FCF异常",
+                        mode="markers",
+                        marker=dict(
+                            symbol="x",
+                            size=14,
+                            color="#ef4444",
+                            line=dict(width=2, color="#fecaca"),
+                        ),
+                        hovertemplate="%{x}<br>DCF 24x %{y:,.2f}<extra>FCF 数据质量异常</extra>",
+                    ))
 
         # FMP DCF intrinsic value
         fmp_dcf_value = data.get("fmp_dcf_value")
@@ -786,11 +820,10 @@ class MarketAnalyzer:
                 bordercolor="#00d4ff", borderwidth=1, borderpad=4,
             ))
 
-        # Axis ranges
-        price_max = ohlcv["High"].max()
-        price_min = ohlcv["Low"].min()
-        y_top = price_max * 1.12
-        y_bottom = max(0, price_min * 0.88)
+        # Axis ranges — 仅日 K 的 Low 最低、High 最高×2（叠加线可能超出可视范围）
+        _lmin = pd.to_numeric(ohlcv["Low"], errors="coerce").min() if "Low" in ohlcv.columns else float("nan")
+        _hmax = pd.to_numeric(ohlcv["High"], errors="coerce").max() if "High" in ohlcv.columns else float("nan")
+        y_bottom, y_top = _kline_y_axis_range(_lmin, _hmax)
 
         date_min = ohlcv["Date"].min()
         date_max = ohlcv["Date"].max()

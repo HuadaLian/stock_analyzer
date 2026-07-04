@@ -41,6 +41,9 @@ def test_repeated_fcf_upsert_preserves_revenue_and_roic(in_memory_db):
         "fcf_per_share": 2.48,           # 新值
         "shares_out": 24_500.0,          # 新值
         "source": "fmp",
+        "fcf_quality": "ok",
+        "fcf_scale_divisor": 1,
+        "fcf_fmp_unit_notes": None,
     })
     upsert_fundamentals_annual(in_memory_db, [base])
 

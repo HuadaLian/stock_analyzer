@@ -7,16 +7,20 @@ Safe to re-run at any time — all writes use upsert.
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import pandas as pd
 import duckdb
 from datetime import datetime
 
+from db.fcf_quality import dcf_source_fundamentals_quality_sql
 from etl.loader import (
     upsert_dcf_history,
     upsert_dcf_metrics,
     upsert_ohlcv_ema,
 )
+
+_DCF_FUND_QUALITY = dcf_source_fundamentals_quality_sql()
 
 
 def compute_short_potential(latest_price: float | None,
@@ -43,6 +47,63 @@ def compute_invest_potential(latest_price: float | None,
     return (dcf_14x - latest_price) / dcf_14x
 
 
+def _latest_close_usd_for_dcf(
+    ticker: str,
+    conn: duckdb.DuckDBPyConnection,
+) -> tuple[float | None, object | None]:
+    """最新价折成 USD/股，与 ``fundamentals_annual.fcf_per_share``（美元）及 DCF 线可比。
+
+    顺序：listing 已为 USD 则用 ``adj_close``；否则优先 ``adj_close * (market_cap_usd / market_cap)``
+    （与 ETL 市值折美元同源）；再否则尝试 FMP 日频 FX；失败返回 ``(None, date)``，潜力分数写 NULL。
+    """
+    row = conn.execute(
+        """
+        SELECT o.adj_close, o.date, o.market_cap, o.market_cap_usd,
+               upper(trim(coalesce(c.currency, ''))) AS listing_ccy
+        FROM ohlcv_daily o
+        LEFT JOIN companies c ON c.ticker = o.ticker
+        WHERE o.ticker = ? AND o.adj_close IS NOT NULL
+        ORDER BY o.date DESC
+        LIMIT 1
+        """,
+        [ticker],
+    ).fetchone()
+    if not row or row[0] is None:
+        return None, None
+    adj = float(row[0])
+    dt = row[1]
+    mcap_loc = row[2]
+    mcap_usd = row[3]
+    listing = (row[4] or "").strip() or "USD"
+
+    if listing == "USD":
+        return adj, dt
+
+    if mcap_loc is not None and mcap_usd is not None:
+        try:
+            ml = float(mcap_loc)
+            mu = float(mcap_usd)
+            if ml > 0 and mu > 0 and math.isfinite(ml) and math.isfinite(mu):
+                px = adj * (mu / ml)
+                if math.isfinite(px) and px > 0:
+                    return px, dt
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        from etl.sources.fmp import fetch_fx_to_usd, _rate_on_or_before
+
+        ds = str(dt)[:10]
+        fx = fetch_fx_to_usd(listing, ds, ds)
+        rate = _rate_on_or_before(fx, ds)
+        if rate and math.isfinite(float(rate)) and float(rate) > 0:
+            return adj * float(rate), dt
+    except Exception:
+        pass
+
+    return None, dt
+
+
 def _latest_close(ticker: str,
                   conn: duckdb.DuckDBPyConnection) -> tuple[float | None, object]:
     """从 ohlcv_daily 取最新一行的 (adj_close, date)；缺数据返回 (None, None)。"""
@@ -66,16 +127,20 @@ def compute_dcf_lines(ticker: str, conn: duckdb.DuckDBPyConnection) -> dict:
     - dcf_Nx = avg × N
 
     Writes the latest values to dcf_metrics table.
+    ``latest_price`` 为与 DCF 线同口径的 **USD/股**（非 USD 上市货币时用
+    ``market_cap_usd / market_cap`` 或 FMP FX 折算；失败则潜力为 NULL）。
     Returns the full per-year series as a DataFrame for chart rendering.
     """
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT fiscal_year, fiscal_end_date, fcf_per_share
         FROM fundamentals_annual
         WHERE ticker = ? AND fcf_per_share IS NOT NULL
+          AND {_DCF_FUND_QUALITY}
         ORDER BY fiscal_year ASC
     """, [ticker]).fetchall()
 
     if not rows:
+        conn.execute("DELETE FROM dcf_metrics WHERE ticker = ?", [ticker])
         return {}
 
     # Build {date: fcf_per_share} dict
@@ -122,7 +187,7 @@ def compute_dcf_lines(ticker: str, conn: duckdb.DuckDBPyConnection) -> dict:
     d24 = 24 * latest_avg
     d34 = 34 * latest_avg
 
-    latest_price, latest_date = _latest_close(ticker, conn)
+    latest_price, latest_date = _latest_close_usd_for_dcf(ticker, conn)
     short_pot = compute_short_potential(latest_price, d34)
     invest_pot = compute_invest_potential(latest_price, d14)
 
@@ -219,13 +284,15 @@ def compute_dcf_history(ticker: str,
     historical step-line. anchor_date = filing_date snapped to nearest
     trading day so the line aligns with candle x-axis.
     """
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT fiscal_year, filing_date, fcf_per_share
         FROM fundamentals_annual
         WHERE ticker = ? AND fcf_per_share IS NOT NULL
+          AND {_DCF_FUND_QUALITY}
         ORDER BY fiscal_year ASC
     """, [ticker]).fetchall()
     if not rows:
+        conn.execute("DELETE FROM dcf_history WHERE ticker = ?", [ticker])
         return 0
 
     years = [r[0] for r in rows]
@@ -251,5 +318,6 @@ def compute_dcf_history(ticker: str,
             "dcf_34x":        34 * avg,
         })
 
+    conn.execute("DELETE FROM dcf_history WHERE ticker = ?", [ticker])
     upsert_dcf_history(conn, out_rows)
     return len(out_rows)

@@ -30,6 +30,7 @@ from etl.loader import (
 )
 from etl.sources.fmp import (
     fetch_fcf_annual,
+    fetch_latest_fx_to_usd,
     fetch_income_statement_annual,
     fetch_management,
     fetch_ohlcv,
@@ -381,6 +382,11 @@ def fetch_ticker_bundle(ticker: str, ctx: TickerFetchContext, options: USRunOpti
             raise ValueError(f"{t}: FMP marks isEtf/isFund — skip (not operating common stock)")
         bundle.profile = profile
         shares_out_raw = profile.get("_shares_out_raw")
+        listing_currency = str(profile.get("currency") or "USD").upper()
+        try:
+            market_cap_fx_to_usd = fetch_latest_fx_to_usd(listing_currency)
+        except Exception:
+            market_cap_fx_to_usd = 1.0 if listing_currency == "USD" else None
 
         if mode == "fmp_dcf":
             bundle.fcf_rows = []
@@ -420,7 +426,9 @@ def fetch_ticker_bundle(ticker: str, ctx: TickerFetchContext, options: USRunOpti
                 if ohlcv_from and ohlcv_from > ohlcv_to:
                     bundle.ohlcv_rows = []
                 else:
-                    bundle.ohlcv_rows = fetch_ohlcv(t, shares_out_raw, date_from=ohlcv_from, date_to=ohlcv_to)
+                    bundle.ohlcv_rows = fetch_ohlcv(
+                        t, shares_out_raw, market_cap_fx_to_usd, date_from=ohlcv_from, date_to=ohlcv_to
+                    )
                 bundle.ohlcv_from = ohlcv_from
                 bundle.ohlcv_to = ohlcv_to
             finally:
@@ -478,7 +486,9 @@ def fetch_ticker_bundle(ticker: str, ctx: TickerFetchContext, options: USRunOpti
                 if ohlcv_from and ohlcv_from > ohlcv_to:
                     bundle.ohlcv_rows = []
                 else:
-                    bundle.ohlcv_rows = fetch_ohlcv(t, shares_out_raw, date_from=ohlcv_from, date_to=ohlcv_to)
+                    bundle.ohlcv_rows = fetch_ohlcv(
+                        t, shares_out_raw, market_cap_fx_to_usd, date_from=ohlcv_from, date_to=ohlcv_to
+                    )
                 bundle.ohlcv_from = ohlcv_from
                 bundle.ohlcv_to = ohlcv_to
             finally:

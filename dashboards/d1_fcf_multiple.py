@@ -29,6 +29,7 @@ from etl.sources.fmp_dcf import fetch_fmp_dcf_history
 from etl.sources.fmp import fetch_profile, fetch_ohlcv, fetch_fx_to_usd
 from data_provider import _fmp_analyst_data
 from futu_client import FutuClient
+from analyzers.base import _kline_y_axis_range
 
 
 _DCF_COLORS = {
@@ -252,6 +253,32 @@ def _ensure_ema_columns(df_ohlcv: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _fundamentals_rows_for_dcf_chart(df_fund: pd.DataFrame) -> pd.DataFrame:
+    """Only rows that should drive DCF 阶梯：有每股 FCF，且质检为 ok / scaled_* / currency_shift。
+
+    排除 ``flagged_magnitude`` 等，避免与已修正财报不一致的陈旧 ``dcf_history`` 混用。
+    """
+    if df_fund.empty or "fcf_per_share" not in df_fund.columns:
+        return df_fund.iloc[0:0].copy()
+    out = df_fund.copy()
+    ps = pd.to_numeric(out["fcf_per_share"], errors="coerce")
+    mask = ps.notna()
+    if "fcf_quality" in out.columns:
+
+        def _trusted(q) -> bool:
+            s = str(q or "ok").strip().lower()
+            if s in ("", "ok", "none", "nan"):
+                return True
+            if s.startswith("scaled_"):
+                return True
+            if s == "currency_shift":
+                return True
+            return False
+
+        mask &= out["fcf_quality"].map(_trusted)
+    return out.loc[mask].copy()
+
+
 def _build_dcf_history_fallback(df_fund: pd.DataFrame,
                                 df_ohlcv: pd.DataFrame,
                                 ticker: str) -> pd.DataFrame:
@@ -308,7 +335,8 @@ def _build_chart(df_ohlcv: pd.DataFrame,
                  df_fmp_dcf: pd.DataFrame,
                  ticker: str,
                  display_currency: str = "USD",
-                 currency_symbol: str = "$") -> go.Figure:
+                 currency_symbol: str = "$",
+                 df_fund: pd.DataFrame | None = None) -> go.Figure:
     latest_price = float(df_ohlcv["adj_close"].iloc[-1]) if not df_ohlcv.empty else None
 
     fig = go.Figure()
@@ -367,6 +395,36 @@ def _build_chart(df_ohlcv: pd.DataFrame,
                 connectgaps=True,
             ))
 
+    bad_fy: set[int] = set()
+    if df_fund is not None and not df_fund.empty and "fcf_quality" in df_fund.columns:
+        for _, r in df_fund.iterrows():
+            q = str(r.get("fcf_quality") or "ok").strip().lower()
+            if q in ("", "ok", "none", "nan") or q.startswith("scaled_"):
+                continue
+            if q == "currency_shift":
+                continue
+            try:
+                bad_fy.add(int(r["fiscal_year"]))
+            except (TypeError, ValueError):
+                pass
+
+    if not df_dcf_hist.empty and bad_fy:
+        dcf_mk = df_dcf_hist[df_dcf_hist["fiscal_year"].isin(bad_fy)]
+        if not dcf_mk.empty:
+            fig.add_trace(go.Scatter(
+                x=dcf_mk["anchor_date"],
+                y=dcf_mk["dcf_24x"],
+                name="FCF异常",
+                mode="markers",
+                marker=dict(
+                    symbol="x",
+                    size=14,
+                    color="#ef4444",
+                    line=dict(width=2, color="#fecaca"),
+                ),
+                hovertemplate="%{x}<br>DCF 24x %{y:,.2f}<extra>FCF 数据质量异常</extra>",
+            ))
+
     latest_fmp = None
     if not df_fmp_dcf.empty:
         fmp_vals = pd.to_numeric(df_fmp_dcf["dcf_value"], errors="coerce").dropna()
@@ -400,32 +458,9 @@ def _build_chart(df_ohlcv: pd.DataFrame,
             borderpad=4,
         ))
 
-    # Build y-range from all plotted series so DCF/FMP DCF lines are never clipped.
-    y_candidates = []
-    y_candidates.extend(pd.to_numeric(df_ohlcv["high"], errors="coerce").dropna().tolist())
-    y_candidates.extend(pd.to_numeric(df_ohlcv["low"], errors="coerce").dropna().tolist())
-    y_candidates.extend(pd.to_numeric(df_ohlcv["ema10"], errors="coerce").dropna().tolist())
-    y_candidates.extend(pd.to_numeric(df_ohlcv["ema250"], errors="coerce").dropna().tolist())
-
-    if not df_dcf_hist.empty:
-        for col in ["dcf_14x", "dcf_24x", "dcf_34x"]:
-            if col in df_dcf_hist.columns:
-                y_candidates.extend(pd.to_numeric(df_dcf_hist[col], errors="coerce").dropna().tolist())
-
-    if latest_fmp is not None:
-        y_candidates.append(latest_fmp)
-
-    if y_candidates:
-        y_max = max(y_candidates)
-        y_min = min(y_candidates)
-        span = max(y_max - y_min, 1e-6)
-        y_top = y_max + span * 0.12
-        y_bottom = max(0.0, y_min - span * 0.12)
-    else:
-        price_max = float(df_ohlcv["high"].max())
-        price_min = float(df_ohlcv["low"].min())
-        y_top = price_max * 1.12
-        y_bottom = max(0.0, price_min * 0.88)
+    _lmin = pd.to_numeric(df_ohlcv["low"], errors="coerce").min() if "low" in df_ohlcv.columns else float("nan")
+    _hmax = pd.to_numeric(df_ohlcv["high"], errors="coerce").max() if "high" in df_ohlcv.columns else float("nan")
+    y_bottom, y_top = _kline_y_axis_range(_lmin, _hmax)
 
     date_min = pd.to_datetime(df_ohlcv["date"]).min()
     date_max = pd.to_datetime(df_ohlcv["date"]).max()
@@ -1057,17 +1092,21 @@ def _render_analyst_panel_d1(ticker: str, latest_price: float | None) -> None:
         st.warning(f"分析师数据加载失败: {str(e)[:50]}")
 
 
+def _futu_opend_alive(host: str = "127.0.0.1", port: int = 11111, timeout: float = 0.3) -> bool:
+    """Quick TCP probe: SDK reconnect-loop blocks ~40s when OpenD is down,
+    which delays D1 right panel and visually hides D2/D3 below."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _render_price_alert_panel_d1(ticker: str, dcf_metrics: dict | None) -> None:
     """Render compact price alert panel."""
     try:
-        # Try to connect to Futu OpenD
-        try:
-            with FutuClient() as client:
-                futu_connected = True
-        except Exception:
-            futu_connected = False
-        
-        if not futu_connected:
+        if not _futu_opend_alive():
             st.warning("需要启动 Futu OpenD (127.0.0.1:11111) 来设置价格提醒")
             return
 
@@ -1175,9 +1214,14 @@ def _render_metrics_panel(
             mcap_display = "—"
         market_cap_text = mcap_display
         
-        # Latest and average FCF
+        # Latest and average FCF（与 DCF 阶梯一致：仅可信财报行）
         if not df_fund.empty:
-            df_fund_sorted = df_fund.sort_values("fiscal_year", ascending=False)
+            df_fc = _fundamentals_rows_for_dcf_chart(df_fund)
+            df_fund_sorted = (
+                df_fc.sort_values("fiscal_year", ascending=False)
+                if not df_fc.empty
+                else df_fund.sort_values("fiscal_year", ascending=False)
+            )
             latest_fcf_ps = df_fund_sorted.iloc[0].get("fcf_per_share")
             if latest_fcf_ps is not None:
                 latest_fcf_ps = float(latest_fcf_ps)
@@ -1325,12 +1369,32 @@ def render_d1_stock(market: str = "US", ticker_override: str | None = None) -> s
 
         df_ohlcv = _ensure_ema_columns(df_ohlcv)
         df_fund = get_fundamentals(ticker, conn=conn)
-        df_dcf_hist = get_dcf_history(ticker, conn=conn)
-        if df_dcf_hist.empty:
-            df_dcf_hist = _build_dcf_history_fallback(df_fund, df_ohlcv, ticker)
+        df_dcf_hist_db = get_dcf_history(ticker, conn=conn)
+        fund_for_dcf = _fundamentals_rows_for_dcf_chart(df_fund)
+        df_dcf_from_fund = _build_dcf_history_fallback(fund_for_dcf, df_ohlcv, ticker)
+        if not df_dcf_from_fund.empty:
+            df_dcf_hist = df_dcf_from_fund
+        elif not df_dcf_hist_db.empty:
+            df_dcf_hist = df_dcf_hist_db
+        else:
+            df_dcf_hist = df_dcf_from_fund
         df_fmp_dcf = get_fmp_dcf_history(ticker, conn=conn)
         company = get_company(ticker, conn=conn)
         dcf_metrics = get_dcf_metrics(ticker, conn=conn)
+        if not df_dcf_hist.empty:
+            last_dcf = df_dcf_hist.sort_values("fiscal_year").iloc[-1]
+            patch = {}
+            for k, col in (
+                ("fcf_per_share_avg3yr", "fcf_ps_avg3yr"),
+                ("dcf_14x", "dcf_14x"),
+                ("dcf_24x", "dcf_24x"),
+                ("dcf_34x", "dcf_34x"),
+            ):
+                v = last_dcf.get(col)
+                if v is not None and pd.notna(v):
+                    patch[k] = float(v)
+            if patch:
+                dcf_metrics = {**(dcf_metrics or {}), **patch, "ticker": ticker}
 
     listing_currency = str((company or {}).get("currency") or features.display_currency or "USD").upper()
     currency_symbol = _currency_symbol(listing_currency)
@@ -1345,6 +1409,7 @@ def render_d1_stock(market: str = "US", ticker_override: str | None = None) -> s
         ticker=ticker,
         display_currency=listing_currency,
         currency_symbol=currency_symbol,
+        df_fund=df_fund_display,
     )
 
     with col_left:

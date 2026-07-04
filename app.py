@@ -5,6 +5,7 @@ import os
 import time
 from pathlib import Path
 from db.schema import get_conn, DB_PATH, READ_DB_ENV
+from db.repository import pick_random_company_ticker
 from etl.pipeline import USRunOptions, run_us_ticker
 from etl.snapshot import snapshot_db
 
@@ -15,10 +16,39 @@ from etl.snapshot import snapshot_db
 from dashboards.db_status import bootstrap_read_replica, render_status_caption
 from dashboards.db_quality import render_db_quality_tab
 from dashboards.symbol_registry import search_registry_options
-from dashboards.factor_lab import render_factor_lab
+from dashboards.factor_lab import FV_TO_VIEW_MODE, parse_factor_pager_ffilt, render_factor_lab
+
 bootstrap_read_replica()
 
-from analyzers import USAnalyzer
+
+def _factor_nonneg_page_param(raw) -> int | None:
+    if raw is None:
+        return None
+    s = str((raw[0] if isinstance(raw, list) else raw)).strip()
+    if not s:
+        return None
+    try:
+        return max(0, int(s))
+    except ValueError:
+        return None
+
+
+def _factor_nonneg_mcap_param(raw) -> float | None:
+    """因子榜 URL ``fmm``：最小市值(USD, M)，非负有限数。"""
+    if raw is None:
+        return None
+    s = str((raw[0] if isinstance(raw, list) else raw)).strip()
+    if not s:
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    if v < 0.0 or v != v or abs(v) > 1e308:  # nan / inf
+        return None
+    return v
+
+from analyzers import USAnalyzer, CNAnalyzer, HKAnalyzer
 from dashboards.d1_fcf_multiple import render_d1_stock
 from dashboards.d2_business import render_d2_stock
 from dashboards.d3_industry import render_d3_stock
@@ -31,6 +61,28 @@ from gemini_chat import (
     load_fcf_rules, save_fcf_rules,
     get_model_call_status, reset_model_call_status,
 )
+
+# 年报下载入口：独立于所有看板，按输入代码自动路由 US→SEC / CN→巨潮。
+def _run_global_filing_download(raw: str):
+    """根据用户输入的代码自动判断市场并下载年报（仅下载存档，不触发计算 / AI 补全）。"""
+    raw = (raw or "").strip()
+    if not raw:
+        st.warning("请先在搜索框输入代码，再下载年报。")
+        return
+    market, ticker = parse_global_symbol(raw)
+    if market == "CN":
+        # 巨潮按 6 位数字代码检索，去掉 .SS / .SH / .SZ 等后缀
+        code = CNAnalyzer().normalize_ticker(ticker.split(".", 1)[0])
+        st.caption(f"📥 A股年报（巨潮资讯） · `{code}`")
+        CNAnalyzer().download_filings_ui(code)
+    elif market == "US":
+        us = USAnalyzer()
+        norm = us.normalize_ticker(ticker)
+        st.caption(f"📥 SEC 年报 · `{norm}`")
+        us.download_filings_ui(norm)
+    else:  # HK
+        st.info("港股年报下载功能即将上线。")
+
 
 # ── Page config ──────────────────────────────────────────────────────────
 st.set_page_config(page_title="Stock Analyzer", layout="wide")
@@ -229,6 +281,68 @@ _MAIN_NAV_LABELS = (
     "🧪 数据库质量检测",
     "⚙️ 设置",
 )
+# 因子榜浮动分页：?finv_page=&fshort_page=&fv= 绝对页码（推荐，可跨整页跳转对齐页码）
+_fi_q = st.query_params.get("finv_page")
+_fs_q = st.query_params.get("fshort_page")
+_fi_n = _factor_nonneg_page_param(_fi_q)
+_fs_n = _factor_nonneg_page_param(_fs_q)
+if _fi_n is not None or _fs_n is not None:
+    st.session_state["main_nav_tab"] = _MAIN_NAV_LABELS[1]
+    _fv_abs_q = st.query_params.get("fv")
+    _fv_abs = (str(_fv_abs_q[0] if isinstance(_fv_abs_q, list) else _fv_abs_q).strip() if _fv_abs_q else "")
+    if _fv_abs == "both":
+        st.session_state["factor_view_mode"] = "仅投资榜单"
+    elif _fv_abs in FV_TO_VIEW_MODE:
+        st.session_state["factor_view_mode"] = FV_TO_VIEW_MODE[_fv_abs]
+    if _fi_n is not None:
+        st.session_state["factor_page_invest"] = _fi_n
+    if _fs_n is not None:
+        st.session_state["factor_page_short"] = _fs_n
+    # 浮动分页用 <a href> 会整页刷新、清空 session；用 ffilt 写回筛选，旧链接可仍只带 fmm。
+    _ffilt_parsed = parse_factor_pager_ffilt(st.query_params.get("ffilt"))
+    if _ffilt_parsed is not None:
+        st.session_state["factor_market_scope"] = _ffilt_parsed["markets"]
+        st.session_state["factor_country_scope"] = _ffilt_parsed["countries"]
+        st.session_state["factor_sector_pick"] = _ffilt_parsed["sectors"]
+        st.session_state["factor_industry_pick"] = _ffilt_parsed["industries"]
+        st.session_state["factor_min_mcap_usd_m"] = _ffilt_parsed["min_mcap_usd_m"]
+    else:
+        _fmm_n = _factor_nonneg_mcap_param(st.query_params.get("fmm"))
+        if _fmm_n is not None:
+            st.session_state["factor_min_mcap_usd_m"] = _fmm_n
+    for _qk in ("finv_page", "fshort_page", "fv", "ffilt", "fmm"):
+        try:
+            del st.query_params[_qk]
+        except KeyError:
+            pass
+    st.rerun()
+
+# 因子榜旧式相对翻页 ?fp=&d=&fv=（书签兼容）
+_fp_q = st.query_params.get("fp")
+_d_q = st.query_params.get("d")
+_fv_q = st.query_params.get("fv")
+_fp_nav = (_fp_q[0] if isinstance(_fp_q, list) else _fp_q) or ""
+_d_nav = (_d_q[0] if isinstance(_d_q, list) else _d_q) or ""
+_fv_nav = (_fv_q[0] if isinstance(_fv_q, list) else _fv_q) or ""
+_fp_nav = str(_fp_nav).strip()
+_d_nav = str(_d_nav).strip()
+_fv_nav = str(_fv_nav).strip()
+if _fp_nav in ("finv", "fshort") and _d_nav in ("prev", "next"):
+    _pk = "factor_page_invest" if _fp_nav == "finv" else "factor_page_short"
+    _cur_pg = max(0, int(st.session_state.get(_pk, 0)))
+    st.session_state[_pk] = max(0, _cur_pg - 1) if _d_nav == "prev" else _cur_pg + 1
+    st.session_state["main_nav_tab"] = _MAIN_NAV_LABELS[1]
+    if _fv_nav == "both":
+        st.session_state["factor_view_mode"] = "仅投资榜单"
+    elif _fv_nav in FV_TO_VIEW_MODE:
+        st.session_state["factor_view_mode"] = FV_TO_VIEW_MODE[_fv_nav]
+    for _qk in ("fp", "d", "fv"):
+        try:
+            del st.query_params[_qk]
+        except KeyError:
+            pass
+    st.rerun()
+
 _pending_nav = st.session_state.pop("_nav_main_tab", None)
 if _pending_nav in _MAIN_NAV_LABELS:
     st.session_state["main_nav_tab"] = _pending_nav
@@ -300,12 +414,30 @@ if _nav == _MAIN_NAV_LABELS[0]:
     st.subheader("📈 个股分析中心")
     st.caption("一个搜索框覆盖全球普通股（US/ADR/OTC、A股、港股）。")
 
+    _global_ticker_fallback = "NVDA"
+
     # Streamlit: widget key must only be mutated before widget instantiation.
     pending_query = st.session_state.pop("_global_symbol_query_pending", None)
     if pending_query is not None:
         st.session_state["global_symbol_query"] = pending_query
 
-    q_col, btn_col = st.columns([5, 1])
+    # 首次进入：默认 US；从 companies 单次随机一行（无筛选），避免首次打开过慢。
+    if "global_selected_market" not in st.session_state:
+        st.session_state["global_selected_market"] = "US"
+    if "global_selected_ticker" not in st.session_state:
+        _m0 = str(st.session_state.get("global_selected_market") or "US").strip().upper()
+        _rnd_tk = pick_random_company_ticker(_m0)
+        st.session_state["global_selected_ticker"] = (_rnd_tk or _global_ticker_fallback).strip().upper()
+    if "global_symbol_query" not in st.session_state:
+        st.session_state["global_symbol_query"] = str(
+            st.session_state.get("global_selected_ticker") or _global_ticker_fallback
+        )
+    if "active_market" not in st.session_state:
+        st.session_state["active_market"] = st.session_state["global_selected_market"]
+    if "active_ticker" not in st.session_state:
+        st.session_state["active_ticker"] = st.session_state["global_selected_ticker"]
+
+    q_col, btn_col, dl_col = st.columns([5, 1, 1])
     with q_col:
         symbol_query = st.text_input(
             "搜索代码",
@@ -335,15 +467,19 @@ if _nav == _MAIN_NAV_LABELS[0]:
     with btn_col:
         st.markdown("<div style='margin-top: 28px'></div>", unsafe_allow_html=True)
         do_analyze_global = st.button("分析", key="global_analyze_btn", use_container_width=True)
+    with dl_col:
+        st.markdown("<div style='margin-top: 28px'></div>", unsafe_allow_html=True)
+        do_download_filings = st.button(
+            "📥 年报", key="global_dl_filings_btn", use_container_width=True,
+            help="按代码自动判断 SEC（美股）/ 巨潮（A股）下载年报存档",
+        )
 
-    if "global_selected_market" not in st.session_state:
-        st.session_state["global_selected_market"] = "US"
-    if "global_selected_ticker" not in st.session_state:
-        st.session_state["global_selected_ticker"] = "NVDA"
-    if "active_market" not in st.session_state:
-        st.session_state["active_market"] = st.session_state["global_selected_market"]
-    if "active_ticker" not in st.session_state:
-        st.session_state["active_ticker"] = st.session_state["global_selected_ticker"]
+    # 每轮用 apply_global_selection 收敛 market（GLOBAL 等→US/CN/HK），避免 US/CN/HK 分支整段跳过。
+    apply_global_selection(
+        st.session_state,
+        str(st.session_state.get("global_selected_market") or "US").strip().upper(),
+        str(st.session_state.get("global_selected_ticker") or "").strip().upper() or _global_ticker_fallback,
+    )
 
     if do_analyze_global and symbol_query.strip():
         mkt, tk = parse_global_symbol(symbol_query)
@@ -360,8 +496,13 @@ if _nav == _MAIN_NAV_LABELS[0]:
                 else:
                     st.warning(msg)
 
+    # 年报下载：独立于看板，按搜索框代码自动路由（全宽渲染日志）
+    if do_download_filings:
+        _run_global_filing_download(symbol_query)
+        st.divider()
+
     selected_market = st.session_state.get("global_selected_market", "US")
-    selected_ticker = st.session_state.get("global_selected_ticker", "NVDA")
+    selected_ticker = st.session_state.get("global_selected_ticker", _global_ticker_fallback)
     st.caption(f"当前目标: `{selected_market}` · `{selected_ticker}`")
 
     if selected_market in ("US", "CN", "HK"):

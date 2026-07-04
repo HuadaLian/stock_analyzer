@@ -17,6 +17,7 @@ def _fetch_cn_data(code):
 class CNAnalyzer(MarketAnalyzer):
     market = "CN"
     default_currency = "CNY"
+    supports_filing_download = True  # 巨潮年报下载
     ticker_input_label = "A股代码 (6位)"
     ticker_input_default = ""
     analyze_button_label = "📊 一键分析 (K线 + 下载 + 财务)"
