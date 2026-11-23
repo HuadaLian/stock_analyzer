@@ -231,7 +231,7 @@ class SmartSECDownloader:
         # SEC submissions are in reverse-chronological order, so we see newest first.
         total_registered = 0
         quarterly_count = 0
-        MAX_QUARTERLY = 4  # only need the most recent 3-4 quarters
+        MAX_QUARTERLY = 100  # only need the most recent 3-4 quarters
         for filings in batches:
             n = len(filings["accessionNumber"])
             for i in range(n):

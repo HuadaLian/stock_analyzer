@@ -11,31 +11,28 @@ import tushare as ts
 
 
 def load_tushare_token(repo_root: Path | None = None) -> str:
-    """Load Tushare token from env/.env with backward-compatible key names."""
-    token = (
-        os.environ.get("TUSHARE_TOKEN", "").strip()
-        or os.environ.get("TUSHARE_API_KEY", "").strip()
-    )
-    if token:
-        return token
-
+    """Prefer the current repo .env token, falling back to process environment."""
     root = repo_root or Path(__file__).resolve().parents[2]
     env_path = root / ".env"
-    if not env_path.is_file():
-        return ""
-    try:
+    file_tokens = {}
+    if env_path.is_file():
         for raw in env_path.read_text(encoding="utf-8-sig").splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            key, _, val = line.partition("=")
-            k = key.strip().upper()
-            v = val.strip().strip('"').strip("'")
-            if k in ("TUSHARE_TOKEN", "TUSHARE_API_KEY") and v:
-                return v
-    except OSError:
-        return ""
-    return ""
+            key, _, value = line.partition("=")
+            normalized_key = key.strip().upper()
+            token_value = value.strip().strip('"').strip("'")
+            if normalized_key in ("TUSHARE_TOKEN", "TUSHARE_API_KEY") and token_value:
+                file_tokens[normalized_key] = token_value
+
+    token = file_tokens.get("TUSHARE_TOKEN") or file_tokens.get("TUSHARE_API_KEY")
+    if token:
+        return token
+    return (
+        os.environ.get("TUSHARE_TOKEN", "").strip()
+        or os.environ.get("TUSHARE_API_KEY", "").strip()
+    )
 
 
 def _to_ts_code(code: str) -> str:

@@ -52,6 +52,7 @@ from analyzers import USAnalyzer, CNAnalyzer, HKAnalyzer
 from dashboards.d1_fcf_multiple import render_d1_stock
 from dashboards.d2_business import render_d2_stock
 from dashboards.d3_industry import render_d3_stock
+from magic_formula.dashboard import render_magic_formula
 from chart_store import load_chart
 from analysis_tracker import get_analyzed_tickers
 from core.symbol_router import parse_global_symbol, apply_global_selection
@@ -277,6 +278,7 @@ if "_sid" not in st.session_state:
 # ── Main navigation（可编程切换；因子页跳转 D1 时写入 _nav_main_tab）────────
 _MAIN_NAV_LABELS = (
     "📈 个股分析中心",
+    "✨ Magic Formula",
     "🧪 因子分析",
     "🧪 数据库质量检测",
     "⚙️ 设置",
@@ -287,7 +289,7 @@ _fs_q = st.query_params.get("fshort_page")
 _fi_n = _factor_nonneg_page_param(_fi_q)
 _fs_n = _factor_nonneg_page_param(_fs_q)
 if _fi_n is not None or _fs_n is not None:
-    st.session_state["main_nav_tab"] = _MAIN_NAV_LABELS[1]
+    st.session_state["main_nav_tab"] = _MAIN_NAV_LABELS[2]
     _fv_abs_q = st.query_params.get("fv")
     _fv_abs = (str(_fv_abs_q[0] if isinstance(_fv_abs_q, list) else _fv_abs_q).strip() if _fv_abs_q else "")
     if _fv_abs == "both":
@@ -331,7 +333,7 @@ if _fp_nav in ("finv", "fshort") and _d_nav in ("prev", "next"):
     _pk = "factor_page_invest" if _fp_nav == "finv" else "factor_page_short"
     _cur_pg = max(0, int(st.session_state.get(_pk, 0)))
     st.session_state[_pk] = max(0, _cur_pg - 1) if _d_nav == "prev" else _cur_pg + 1
-    st.session_state["main_nav_tab"] = _MAIN_NAV_LABELS[1]
+    st.session_state["main_nav_tab"] = _MAIN_NAV_LABELS[2]
     if _fv_nav == "both":
         st.session_state["factor_view_mode"] = "仅投资榜单"
     elif _fv_nav in FV_TO_VIEW_MODE:
@@ -945,6 +947,10 @@ def _render_reviewed_market(market: str, analyzer, universe_key: str | None):
 
 
 if _nav == _MAIN_NAV_LABELS[1]:
+    render_magic_formula(st)
+
+
+if _nav == _MAIN_NAV_LABELS[2]:
     if not ENABLE_REVIEWED_TAB:
         render_factor_lab(st)
     else:
@@ -955,14 +961,14 @@ if _nav == _MAIN_NAV_LABELS[1]:
 # =====================================================================
 #  数据库质量检测（读取后台脚本写入的缓存报告）
 # =====================================================================
-if _nav == _MAIN_NAV_LABELS[2]:
+if _nav == _MAIN_NAV_LABELS[3]:
     render_db_quality_tab(st)
 
 
 # =====================================================================
 #  ⚙️ 设置
 # =====================================================================
-if _nav == _MAIN_NAV_LABELS[3]:
+if _nav == _MAIN_NAV_LABELS[4]:
     st.subheader("🤖 Gemini AI 设置")
     st.caption("在此配置 Gemini API Key 和模型。设置会在整个会话中持久生效。")
 

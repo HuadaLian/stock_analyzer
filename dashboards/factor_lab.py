@@ -35,7 +35,7 @@ _SQL_INDUSTRY_LABEL = (
 
 # app.py 仍消费 ``?fp=&d=&fv=`` 以及 ``?finv_page=&fshort_page=&fv=&ffilt=``（浮动分页；
 # ``ffilt`` 为 URL 编码 JSON：市场/国家/板块/行业/最小市值；旧链接可仍带 ``fmm``）。
-# 与 app.py 中 _MAIN_NAV_LABELS[1] 一致。
+# 主导航切换使用稳定的标签，而不是依赖位置索引。
 _MAIN_NAV_FACTOR_LAB_LABEL = "🧪 因子分析"
 FV_TO_VIEW_MODE = {"inv": "仅投资榜单", "sh": "仅做空榜单"}
 VIEW_MODE_TO_FV = {v: k for k, v in FV_TO_VIEW_MODE.items()}
